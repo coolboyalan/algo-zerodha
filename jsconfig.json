@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "#root/*": ["src/*.js"],
+      "#libs/*": ["src/libs/*.lib.js"],
+      "#utils/*": ["src/utils/*.util.js"],
+      "#routes/*": ["src/routes/*.route.js"],
+      "#controllers/*": ["src/controllers/*.controller.js"],
+      "#services/*": ["src/services/*.service.js"],
+      "#configs/*": ["src/configs/*.config.js"],
+      "#models/*": ["src/models/*.model.js"],
+      "#middlewares/*": ["src/middlewares/*.middleware.js"]
+    }
+  },
+  "include": ["src/**/*"]
+}
