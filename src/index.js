@@ -116,6 +116,7 @@ cron.schedule("* * * * * *", async () => {
         }
       }
 
+      console.log(istNow);
       if (isInMarketRange && istMinute % 3 === 0 && second === 0) {
         const toTime = toKiteISTFormat(istNow);
         const fromTime = toKiteISTFormat(
