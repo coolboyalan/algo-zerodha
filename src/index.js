@@ -33,6 +33,8 @@ function toKiteISTFormat(dateObj) {
     dateObj.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
   );
 
+  console.log(true, local);
+
   const yyyy = local.getFullYear();
   const mm = String(local.getMonth() + 1).padStart(2, "0");
   const dd = String(local.getDate()).padStart(2, "0");
