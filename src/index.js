@@ -8,6 +8,7 @@ import { getISTMidnightFakeUTCString } from "#utils/dayChecker";
 import sequelize from "#configs/database";
 import BrokerKey from "#models/brokerKey";
 import Broker from "#models/broker";
+import express from "express";
 
 main();
 
@@ -518,3 +519,7 @@ cron.schedule("* * * * * *", async () => {
     console.log(e);
   }
 });
+
+const server = express();
+
+server.listen(3000);
