@@ -116,7 +116,7 @@ cron.schedule("* * * * * *", async () => {
         }
       }
 
-      if (isInMarketRange && istMinute % 3 === 0 && second === 0) {
+      if (isInMarketRange /**&& istMinute % 3 === 0 && second === 0*/) {
         const toTime = toKiteISTFormat(istNow);
         const fromTime = toKiteISTFormat(
           new Date(istNow.getTime() - 3 * 60 * 1000),
@@ -139,15 +139,19 @@ cron.schedule("* * * * * *", async () => {
         });
 
         const { data } = response.data;
+        console.log(data);
 
         if (
           !data ||
           !Array.isArray(data.candles) ||
           data.candles.length === 0
         ) {
+          console.log(data);
           console.log("⚠️ No candle data available");
           return;
         }
+
+        return;
 
         const latestCandle = data.candles[data.candles.length - 1];
         const price = latestCandle[4]; // close price
