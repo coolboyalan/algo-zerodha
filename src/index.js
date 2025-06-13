@@ -139,14 +139,13 @@ cron.schedule("* * * * * *", async () => {
         });
 
         const { data } = response.data;
-        console.log(data);
+        console.log(interval, fromTime, toTime);
 
         if (
           !data ||
           !Array.isArray(data.candles) ||
           data.candles.length === 0
         ) {
-          console.log(data);
           console.log("⚠️ No candle data available");
           return;
         }
