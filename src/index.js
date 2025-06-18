@@ -53,8 +53,8 @@ cron.schedule("* * * * * *", async () => {
     const second = istNow.getSeconds();
 
     const preRange =
-      (istHour === 7 && istMinute >= 30) ||
-      (istHour > 7 && istHour < 15) ||
+      (istHour === 8 && istMinute >= 30) ||
+      (istHour > 8 && istHour < 15) ||
       (istHour === 15 && istMinute <= 30);
 
     const isInMarketRange =
@@ -116,7 +116,6 @@ cron.schedule("* * * * * *", async () => {
         }
       }
 
-      console.log(istNow);
       if (isInMarketRange && istMinute % 3 === 0 && second === 0) {
         const toTime = toKiteISTFormat(istNow);
         const fromTime = toKiteISTFormat(
@@ -186,7 +185,6 @@ cron.schedule("* * * * * *", async () => {
         }
         // If price is between TC and BC, No Action
         else if (price < tc && price > bc) {
-          direction = lastTrade;
           signal = "Exit";
           reason = "Price is within CPR range.";
         }
@@ -208,22 +206,28 @@ cron.schedule("* * * * * *", async () => {
         const innerLevelMap = { r1, r2, r3, r4, s1, s2, s3, s4, tc, bc };
 
         Object.entries(innerLevelMap).find(([levelName, level]) => {
-          if (signal === "No Action" && lastTrade) {
-            if (lastTrade === "PE") {
-              if (data.close > level && data.open < level) {
-                signal = "Exit";
-                reason = `Price crossed the level ${levelName}`;
-                return true;
-              }
-            } else {
-              if (data.close < level && data.open > level) {
-                signal = "Exit";
-                reason = `Price crossed the level ${levelName}`;
-                return true;
-              }
+          if (signal === "No Action") {
+            if (data.close > level && data.open < level) {
+              signal = "PE Exit";
+              reason = `Price crossed the level ${levelName}`;
+              return true;
+            }
+            if (data.close < level && data.open > level) {
+              signal = "CE Exit";
+              reason = `Price crossed the level ${levelName}`;
+              return true;
             }
           }
         });
+
+        let symbol;
+        if (direction) {
+          symbol = await getSpecificCachedOption(
+            dailyAsset.name,
+            assetPrice,
+            direction,
+          );
+        }
 
         for (const key of keys) {
           const getLTP = async (instrument) => {
@@ -305,6 +309,7 @@ cron.schedule("* * * * * *", async () => {
           let ltp;
           let noOfLots;
 
+          let symbol;
           if (direction) {
             ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
             noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
@@ -364,147 +369,120 @@ cron.schedule("* * * * * *", async () => {
             return await placeIntradayOrder(data);
           }
 
-          const lastTrade = await Trade.findDoc(
-            { brokerKeyId: key.id, type: "entry", parentTrade: null },
+          const lastTrade = await TradeLog.findDoc(
+            { brokerKeyId: key.id, type: "entry" },
             { allowNull: true },
           );
 
-          if (pnl + maxLoss <= 0 && pnl >= maxProfit) {
-            if (!lastTrade) continue;
+          if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
+            if (!lastTrade) {
+              key.status = false;
+              await key.save();
+              continue;
+            }
             const exitOrderData = {
               exchange: lastTrade.asset.split(":")[0],
               tradingsymbol: lastTrade.asset.split(":")[1],
               quantity: lastTrade.quantity,
             };
 
-            const tradeEntry = {
-              brokerId: lastTrade.brokerId,
-              brokerKeyId: lastTrade.id,
-              userId: lastTrade.userId,
-              baseAssetId: lastTrade.baseAssetId,
-              asset: lastTrade.asset,
-              price: ltp,
-              quantity: lastTrade.quantity,
-              parentTrade: lastTrade.id,
-              profitAndLoss:
-                lastTrade.quantity * ltp - lastTrade.price * lastTrade.quantity,
-              tradeTime: new Date(),
-              direction: "sell",
-              type: "exit",
-            };
             await exitOrder(exitOrderData);
-            await Trade.create(tradeEntry);
+            lastTrade.type = "exit";
+            await lastTrade.save();
             key.status = false;
             await key.save();
             continue;
-          } else {
-            if (signal === "No Action") continue;
+          }
+          if (signal === "No Action") continue;
 
-            const symbol = getSpecificCachedOption(
-              dailyAsset.name,
-              assetPrice,
-              direction,
-            );
+          if (
+            signal === "Exit" ||
+            signal === "PE Exit" ||
+            signal === "CE Exit"
+          ) {
+            if (!lastTrade) continue;
 
-            const newOrderData = {};
-            const exitOrderData = {};
+            const exitOrderData = {
+              exchange: lastTrade.asset.split(":")[0],
+              tradingsymbol: lastTrade.asset.split(":")[1],
+              quantity: lastTrade.quantity,
+            };
 
-            newOrderData.exchange = symbol.exchange;
-            newOrderData.tradingsymbol = symbol.tradingsymbol;
-            newOrderData.quantity = noOfLots * symbol.lot_size;
-
-            if (lastTrade) {
-              exitOrderData.exchange = symbol.exchange;
-              exitOrderData.tradingsymbol = lastTrade.asset;
-              exitOrderData.quantity = lastTrade.quantity;
-            }
-
-            if (signal === "Exit") {
-              if (!lastTrade) continue;
-              const tradeEntry = {
-                brokerId: lastTrade.brokerId,
-                brokerKeyId: lastTrade.id,
-                userId: lastTrade.userId,
-                baseAssetId: lastTrade.baseAssetId,
-                asset: lastTrade.asset,
-                price: ltp,
-                quantity: lastTrade.quantity,
-                parentTrade: lastTrade.id,
-                profitAndLoss:
-                  lastTrade.quantity * ltp -
-                  lastTrade.price * lastTrade.quantity,
-                tradeTime: new Date(),
-                direction: "sell",
-                type: "exit",
-              };
-              await exitOrder(exitOrderData);
-              await Trade.create(tradeEntry);
+            if (signal === "PE Exit") {
+              if (lastTrade.direction === "PE") {
+                await exitOrder(exitOrderData);
+                lastTrade.type = "exit";
+                await lastTrade.save();
+                continue;
+              }
+              continue;
+            } else if (signal === "CE Exit") {
+              if (lastTrade.direction === "CE") {
+                await exitOrder(exitOrderData);
+                lastTrade.type = "exit";
+                await lastTrade.save();
+                continue;
+              }
               continue;
             }
 
-            if (lastTrade) {
-              if (direction === "PE" && lastTrade.direction === "sell") {
-                continue;
-              } else if (direction === "CE" && lastTrade.direction === "buyd") {
-                continue;
-              }
-
+            if (signal === "Exit") {
               await exitOrder(exitOrderData);
-              const exitOrderEntry = {
-                brokerId: lastTrade.brokerId,
-                brokerKeyId: lastTrade.id,
-                userId: lastTrade.userId,
-                baseAssetId: lastTrade.baseAssetId,
-                asset: lastTrade.asset,
-                price: ltp,
-                quantity: lastTrade.quantity,
-                parentTrade: lastTrade.id,
-                profitAndLoss:
-                  lastTrade.quantity * ltp -
-                  lastTrade.price * lastTrade.quantity,
-                tradeTime: new Date(),
-                direction: "sell",
-                type: "exit",
-              };
-              await Trade.create(exitOrderEntry);
-
-              await newOrder(newOrderData);
-
-              const tradeEntry = {
-                brokerId: key.brokerId,
-                brokerKeyId: key.id,
-                userId: key.userId,
-                baseAssetId: dailyAsset.id,
-                asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
-                price: ltp,
-                quantity: newOrderData.quantity,
-                parentTrade: null,
-                profitAndLoss: null,
-                tradeTime: new Date(),
-                direction: "buy",
-                type: "entry",
-              };
-
-              await Trade.create(tradeEntry);
-            } else {
-              await newOrder(newOrderData);
-              const tradeEntry = {
-                brokerId: key.brokerId,
-                brokerKeyId: key.id,
-                userId: key.userId,
-                baseAssetId: dailyAsset.id,
-                asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
-                price: ltp,
-                quantity: newOrderData.quantity,
-                parentTrade: null,
-                profitAndLoss: null,
-                tradeTime: new Date(),
-                direction: "buy",
-                type: "entry",
-              };
-
-              await Trade.create(tradeEntry);
+              lastTrade.type = "exit";
+              await lastTrade.save();
+              continue;
             }
+          }
+
+          const newOrderData = {};
+          const exitOrderData = {};
+
+          newOrderData.exchange = symbol.exchange;
+          newOrderData.tradingsymbol = symbol.tradingsymbol;
+          newOrderData.quantity = noOfLots * symbol.lot_size;
+
+          if (lastTrade) {
+            exitOrderData.exchange = lastTrade.asset.split(":")[0];
+            exitOrderData.tradingsymbol = lastTrade.asset.split(":")[1];
+            exitOrderData.quantity = lastTrade.quantity;
+          }
+
+          if (lastTrade) {
+            if (lastTrade.direction === direction) continue;
+            await exitOrder(exitOrderData);
+            lastTrade.type = "exit";
+            await lastTrade.save();
+            const newTradeLog = {
+              brokerId: key.brokerId,
+              brokerKeyId: key.id,
+              userId: key.userId,
+              baseAssetId: dailyAsset.id,
+              asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
+              direction,
+              quantity: newOrderData.quantity,
+              type: "entry",
+            };
+
+            await newOrder(newOrderData);
+            await TradeLog.create(newTradeLog);
+          } else {
+            const newOrderData = {
+              instrument_key: symbol.instrument_key,
+              quantity: noOfLots * symbol.lot_size,
+            };
+            const newTradeLog = {
+              brokerId: key.brokerId,
+              brokerKeyId: key.id,
+              userId: key.userId,
+              baseAssetId: dailyAsset.id,
+              asset: symbol.instrument_key,
+              direction,
+              quantity: newOrderData.quantity,
+              type: "entry",
+            };
+
+            await newOrder(newOrderData);
+            await TradeLog.create(newTradeLog);
           }
         }
 
@@ -528,4 +506,4 @@ cron.schedule("* * * * * *", async () => {
 
 const server = express();
 
-server.listen(3000);
+server.listen(3001);
