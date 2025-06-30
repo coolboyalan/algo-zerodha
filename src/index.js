@@ -338,7 +338,7 @@ cron.schedule("* * * * * *", async () => {
 
               const headers = {
                 "X-Kite-Version": "3",
-                Authorization: `token ${apiKey}:${accessToken}`,
+                Authorization: `token ${key.apiKey}:${key.accessToken}`,
                 "Content-Type": "application/x-www-form-urlencoded",
               };
 
