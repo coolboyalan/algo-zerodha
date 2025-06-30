@@ -45,7 +45,7 @@ BrokerKey.initialize(
       defaultValue: false,
     },
     balance: {
-      type: DataTypes.INTEGER,
+      type: DataTypes.STRING,
     },
     loginUrl: {
       type: DataTypes.TEXT,

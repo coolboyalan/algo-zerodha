@@ -9,6 +9,7 @@ import sequelize from "#configs/database";
 import BrokerKey from "#models/brokerKey";
 import Broker from "#models/broker";
 import express from "express";
+import TradeLog from "#models/tradeLog";
 
 main();
 
@@ -77,7 +78,7 @@ cron.schedule("* * * * * *", async () => {
         if (!dailyAsset) {
           const day = dayMap[istNow.getDay()];
           const [response] = await sequelize.query(
-            `SELECT "name", "zerodhaToken" FROM "DailyAssets"
+            `SELECT "name", "zerodhaToken", "Assets"."id" FROM "DailyAssets"
            INNER JOIN "Assets" ON "DailyAssets"."assetId" = "Assets"."id"
            WHERE "day" = '${day}'`,
           );
@@ -305,19 +306,18 @@ cron.schedule("* * * * * *", async () => {
           };
 
           const balance = await getInitialDayBalance();
-          const usableFunds = (balance / 100) * 40;
+          const usableFunds = (balance / 100) * 25;
           let ltp;
           let noOfLots;
 
-          let symbol;
           if (direction) {
             ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
             noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
           }
           const pnl = await getTodaysPnL();
 
-          const maxLoss = usableFunds / 4;
-          const maxProfit = usableFunds / 2;
+          const maxLoss = balance / 10;
+          const maxProfit = (balance / 10) * 1.5;
 
           const placeIntradayOrder = async ({
             exchange = "NSE",
@@ -373,6 +373,8 @@ cron.schedule("* * * * * *", async () => {
             { brokerKeyId: key.id, type: "entry" },
             { allowNull: true },
           );
+
+          console.log(pnl, maxLoss, maxProfit);
 
           if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
             if (!lastTrade) {
@@ -466,21 +468,16 @@ cron.schedule("* * * * * *", async () => {
             await newOrder(newOrderData);
             await TradeLog.create(newTradeLog);
           } else {
-            const newOrderData = {
-              instrument_key: symbol.instrument_key,
-              quantity: noOfLots * symbol.lot_size,
-            };
             const newTradeLog = {
               brokerId: key.brokerId,
               brokerKeyId: key.id,
               userId: key.userId,
               baseAssetId: dailyAsset.id,
-              asset: symbol.instrument_key,
+              asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
               direction,
               quantity: newOrderData.quantity,
               type: "entry",
             };
-
             await newOrder(newOrderData);
             await TradeLog.create(newTradeLog);
           }
