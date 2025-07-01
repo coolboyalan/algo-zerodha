@@ -9,6 +9,7 @@ const env = cleanEnv(process.env, {
   DB_PASS: str(),
   DB_HOST: str(),
   DB_DIALECT: str(),
+  DB_PORT:num()
 });
 
 export default env;
