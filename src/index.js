@@ -13,7 +13,14 @@ import TradeLog from "#models/tradeLog";
 
 main();
 
+try{
+	
 await sequelize.authenticate();
+	console.log("connected");
+}catch(e){
+	console.log("Cannot connect")
+	process.exit();
+}
 
 let dailyAsset = null;
 let keys = null;
