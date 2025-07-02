@@ -312,7 +312,7 @@ cron.schedule("* * * * * *", async () => {
           };
 
           const balance = await getInitialDayBalance();
-          const usableFunds = (balance / 100) * 40;
+          const usableFunds = (balance / 100) * 25;
           let ltp;
           let noOfLots;
 
