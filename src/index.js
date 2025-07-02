@@ -115,7 +115,7 @@ cron.schedule("* * * * * *", async () => {
          INNER JOIN "Users" ON "BrokerKeys"."userId" = "Users"."id"
          INNER JOIN "Brokers" ON "BrokerKeys"."brokerId" = "Brokers"."id"
          WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'
-         AND "BrokerKeys"."status" = true`,
+         `,
           );
 
           adminKeys = admin[0];
