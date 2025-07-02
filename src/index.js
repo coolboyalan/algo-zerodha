@@ -13,13 +13,12 @@ import TradeLog from "#models/tradeLog";
 
 main();
 
-try{
-	
-await sequelize.authenticate();
-	console.log("connected");
-}catch(e){
-	console.log("Cannot connect")
-	process.exit();
+try {
+  await sequelize.authenticate();
+  console.log("connected");
+} catch (e) {
+  console.log("Cannot connect");
+  process.exit();
 }
 
 let dailyAsset = null;
@@ -313,7 +312,7 @@ cron.schedule("* * * * * *", async () => {
           };
 
           const balance = await getInitialDayBalance();
-          const usableFunds = (balance / 100) * 25;
+          const usableFunds = (balance / 100) * 40;
           let ltp;
           let noOfLots;
 
@@ -345,7 +344,7 @@ cron.schedule("* * * * * *", async () => {
 
               const headers = {
                 "X-Kite-Version": "3",
-                Authorization: `token ${key.apiKey}:${key.accessToken}`,
+                Authorization: `token ${key.apiKey}:${key.apiSecret}`,
                 "Content-Type": "application/x-www-form-urlencoded",
               };
 
@@ -380,8 +379,6 @@ cron.schedule("* * * * * *", async () => {
             { brokerKeyId: key.id, type: "entry" },
             { allowNull: true },
           );
-
-          console.log(pnl, maxLoss, maxProfit);
 
           if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
             if (!lastTrade) {
