@@ -124,6 +124,7 @@ cron.schedule("* * * * * *", async () => {
       }
 
       if (isInMarketRange && istMinute % 3 === 0 && second === 0) {
+        console.log(istNow);
         const toTime = toKiteISTFormat(istNow);
         const fromTime = toKiteISTFormat(
           new Date(istNow.getTime() - 3 * 60 * 1000),
@@ -237,253 +238,288 @@ cron.schedule("* * * * * *", async () => {
         }
 
         for (const key of keys) {
-          const getLTP = async (instrument) => {
-            try {
-              const res = await axios.get("https://api.kite.trade/quote/ltp", {
-                headers: {
+          try {
+            const getLTP = async (instrument) => {
+              try {
+                const res = await axios.get(
+                  "https://api.kite.trade/quote/ltp",
+                  {
+                    headers: {
+                      "X-Kite-Version": "3",
+                      Authorization: `token ${key.apiKey}:${key.token}`,
+                    },
+                    params: {
+                      i: instrument, // e.g., 'NSE:RELIANCE'
+                    },
+                  },
+                );
+
+                const ltp = res.data.data[instrument].last_price;
+                return ltp;
+              } catch (err) {
+                console.error(
+                  "❌ Error fetching LTP:",
+                  err.response?.data || err.message,
+                );
+                throw err;
+              }
+            };
+
+            const getInitialDayBalance = async () => {
+              try {
+                const res = await axios.get(
+                  "https://api.kite.trade/user/margins",
+                  {
+                    headers: {
+                      "X-Kite-Version": "3",
+                      Authorization: `token ${key.apiKey}:${key.token}`,
+                    },
+                  },
+                );
+
+                const openingBalance =
+                  res.data.data.equity.available.opening_balance;
+                return openingBalance;
+              } catch (err) {
+                console.error(
+                  "❌ Error fetching initial day balance:",
+                  err.response?.data || err.message,
+                );
+                throw err;
+              }
+            };
+
+            const getTodaysPnL = async () => {
+              try {
+                const res = await axios.get(
+                  "https://api.kite.trade/portfolio/positions",
+                  {
+                    headers: {
+                      "X-Kite-Version": "3",
+                      Authorization: `token ${key.apiKey}:${key.token}`,
+                    },
+                  },
+                );
+
+                const dayPositions = res.data.data.day || [];
+                const totalPnL = dayPositions.reduce(
+                  (sum, pos) => sum + pos.pnl,
+                  0,
+                );
+                return totalPnL;
+              } catch (err) {
+                console.error(
+                  "❌ Error fetching today's P&L:",
+                  err.response?.data || err.message,
+                );
+                throw err;
+              }
+            };
+
+            const balance = await getInitialDayBalance();
+            const usableFunds = (balance / 100) * 25;
+            let ltp;
+            let noOfLots;
+
+            if (direction) {
+              ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
+              noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
+            }
+            const pnl = await getTodaysPnL();
+
+            const maxLoss = balance / 10;
+            const maxProfit = (balance / 10) * 1.5;
+
+            const placeIntradayOrder = async ({
+              exchange = "NSE",
+              tradingsymbol,
+              transaction_type = "BUY", // or "SELL"
+              quantity = 1,
+            }) => {
+              try {
+                const data = qs.stringify({
+                  tradingsymbol,
+                  exchange,
+                  transaction_type,
+                  order_type: "MARKET",
+                  quantity,
+                  product: "MIS", // Intraday
+                  validity: "DAY",
+                });
+
+                const headers = {
                   "X-Kite-Version": "3",
                   Authorization: `token ${key.apiKey}:${key.token}`,
-                },
-                params: {
-                  i: instrument, // e.g., 'NSE:RELIANCE'
-                },
-              });
+                  "Content-Type": "application/x-www-form-urlencoded",
+                };
 
-              const ltp = res.data.data[instrument].last_price;
-              return ltp;
-            } catch (err) {
-              console.error(
-                "❌ Error fetching LTP:",
-                err.response?.data || err.message,
-              );
-              throw err;
+                const response = await axios.post(
+                  "https://api.kite.trade/orders/regular",
+                  data,
+                  { headers },
+                );
+
+                console.log("✅ Order placed:", response.data);
+                return response.data;
+              } catch (err) {
+                console.error(
+                  "❌ Order error:",
+                  err.response?.data || err.message,
+                );
+                throw err;
+              }
+            };
+
+            async function newOrder(data) {
+              data.transaction_type = "BUY";
+              return await placeIntradayOrder(data);
             }
-          };
 
-          const getInitialDayBalance = async () => {
-            try {
-              const res = await axios.get(
-                "https://api.kite.trade/user/margins",
-                {
-                  headers: {
-                    "X-Kite-Version": "3",
-                    Authorization: `token ${key.apiKey}:${key.token}`,
-                  },
-                },
-              );
-
-              const openingBalance =
-                res.data.data.equity.available.opening_balance;
-              return openingBalance;
-            } catch (err) {
-              console.error(
-                "❌ Error fetching initial day balance:",
-                err.response?.data || err.message,
-              );
-              throw err;
+            async function exitOrder(data) {
+              data.transaction_type = "SELL";
+              return await placeIntradayOrder(data);
             }
-          };
 
-          const getTodaysPnL = async () => {
-            try {
-              const res = await axios.get(
-                "https://api.kite.trade/portfolio/positions",
-                {
-                  headers: {
-                    "X-Kite-Version": "3",
-                    Authorization: `token ${key.apiKey}:${key.token}`,
-                  },
-                },
-              );
+            const lastTrade = await TradeLog.findDoc(
+              { brokerKeyId: key.id, type: "entry" },
+              { allowNull: true },
+            );
 
-              const dayPositions = res.data.data.day || [];
-              const totalPnL = dayPositions.reduce(
-                (sum, pos) => sum + pos.pnl,
-                0,
-              );
-              return totalPnL;
-            } catch (err) {
-              console.error(
-                "❌ Error fetching today's P&L:",
-                err.response?.data || err.message,
-              );
-              throw err;
-            }
-          };
-
-          const balance = await getInitialDayBalance();
-          const usableFunds = (balance / 100) * 25;
-          let ltp;
-          let noOfLots;
-
-          if (direction) {
-            ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
-            noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
-          }
-          const pnl = await getTodaysPnL();
-
-          const maxLoss = balance / 10;
-          const maxProfit = (balance / 10) * 1.5;
-
-          const placeIntradayOrder = async ({
-            exchange = "NSE",
-            tradingsymbol,
-            transaction_type = "BUY", // or "SELL"
-            quantity = 1,
-          }) => {
-            try {
-              const data = qs.stringify({
-                tradingsymbol,
-                exchange,
-                transaction_type,
-                order_type: "MARKET",
-                quantity,
-                product: "MIS", // Intraday
-                validity: "DAY",
-              });
-
-              const headers = {
-                "X-Kite-Version": "3",
-                Authorization: `token ${key.apiKey}:${key.apiSecret}`,
-                "Content-Type": "application/x-www-form-urlencoded",
+            if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
+              if (!lastTrade) {
+                key.status = false;
+                console.log(
+                  "Marking key as inactive, daily limit reached",
+                  key.id,
+                );
+                await key.save();
+                continue;
+              }
+              const exitOrderData = {
+                exchange: lastTrade.asset.split(":")[0],
+                tradingsymbol: lastTrade.asset.split(":")[1],
+                quantity: lastTrade.quantity,
               };
-
-              const response = await axios.post(
-                "https://api.kite.trade/orders/regular",
-                data,
-                { headers },
-              );
-
-              console.log("✅ Order placed:", response.data);
-              return response.data;
-            } catch (err) {
-              console.error(
-                "❌ Order error:",
-                err.response?.data || err.message,
-              );
-              throw err;
-            }
-          };
-
-          async function newOrder(data) {
-            data.transaction_type = "BUY";
-            return await placeIntradayOrder(data);
-          }
-
-          async function exitOrder(data) {
-            data.transaction_type = "SELL";
-            return await placeIntradayOrder(data);
-          }
-
-          const lastTrade = await TradeLog.findDoc(
-            { brokerKeyId: key.id, type: "entry" },
-            { allowNull: true },
-          );
-
-          if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
-            if (!lastTrade) {
+              console.log("Exiting last trade, daily limit reached", key.id);
+              await exitOrder(exitOrderData);
+              lastTrade.type = "exit";
+              console.log("Updating last trade, marking as exited", key.id);
+              await lastTrade.save();
               key.status = false;
+              console.log(
+                "Marking key as inactive, after exiting last trade",
+                key.id,
+              );
               await key.save();
               continue;
             }
-            const exitOrderData = {
-              exchange: lastTrade.asset.split(":")[0],
-              tradingsymbol: lastTrade.asset.split(":")[1],
-              quantity: lastTrade.quantity,
-            };
+            if (signal === "No Action") continue;
 
-            await exitOrder(exitOrderData);
-            lastTrade.type = "exit";
-            await lastTrade.save();
-            key.status = false;
-            await key.save();
-            continue;
-          }
-          if (signal === "No Action") continue;
+            if (
+              signal === "Exit" ||
+              signal === "PE Exit" ||
+              signal === "CE Exit"
+            ) {
+              if (!lastTrade) continue;
 
-          if (
-            signal === "Exit" ||
-            signal === "PE Exit" ||
-            signal === "CE Exit"
-          ) {
-            if (!lastTrade) continue;
+              const exitOrderData = {
+                exchange: lastTrade.asset.split(":")[0],
+                tradingsymbol: lastTrade.asset.split(":")[1],
+                quantity: lastTrade.quantity,
+              };
 
-            const exitOrderData = {
-              exchange: lastTrade.asset.split(":")[0],
-              tradingsymbol: lastTrade.asset.split(":")[1],
-              quantity: lastTrade.quantity,
-            };
+              if (signal === "PE Exit") {
+                if (lastTrade.direction === "PE") {
+                  console.log(
+                    "Signal PE EXIT, lastrade PE, exiting trade",
+                    key.id,
+                  );
+                  await exitOrder(exitOrderData);
+                  lastTrade.type = "exit";
+                  console.log("Updating last trade", key.id);
+                  await lastTrade.save();
+                  continue;
+                }
+                continue;
+              } else if (signal === "CE Exit") {
+                if (lastTrade.direction === "CE") {
+                  console.log(
+                    "Signal CE EXIT, lasttrade CE, exiting trade",
+                    key.id,
+                  );
+                  await exitOrder(exitOrderData);
+                  lastTrade.type = "exit";
+                  console.log("Updating last trade", key.id);
+                  await lastTrade.save();
+                  continue;
+                }
+                continue;
+              }
 
-            if (signal === "PE Exit") {
-              if (lastTrade.direction === "PE") {
+              if (signal === "Exit") {
+                console.log("Signal Exit, Exiting last trade", key.id);
                 await exitOrder(exitOrderData);
                 lastTrade.type = "exit";
+                console.log("Updating last trade", key.id);
                 await lastTrade.save();
                 continue;
               }
-              continue;
-            } else if (signal === "CE Exit") {
-              if (lastTrade.direction === "CE") {
-                await exitOrder(exitOrderData);
-                lastTrade.type = "exit";
-                await lastTrade.save();
-                continue;
-              }
-              continue;
             }
 
-            if (signal === "Exit") {
+            const newOrderData = {};
+            const exitOrderData = {};
+
+            newOrderData.exchange = symbol.exchange;
+            newOrderData.tradingsymbol = symbol.tradingsymbol;
+            newOrderData.quantity = noOfLots * symbol.lot_size;
+
+            if (lastTrade) {
+              exitOrderData.exchange = lastTrade.asset.split(":")[0];
+              exitOrderData.tradingsymbol = lastTrade.asset.split(":")[1];
+              exitOrderData.quantity = lastTrade.quantity;
+            }
+
+            if (lastTrade) {
+              if (lastTrade.direction === direction) continue;
+              console.log("Changing trade, exiting last trade", key.id);
               await exitOrder(exitOrderData);
               lastTrade.type = "exit";
+              console.log("Updating last trade", key.id);
               await lastTrade.save();
-              continue;
+              const newTradeLog = {
+                brokerId: key.brokerId,
+                brokerKeyId: key.id,
+                userId: key.userId,
+                baseAssetId: dailyAsset.id,
+                asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
+                direction,
+                quantity: newOrderData.quantity,
+                type: "entry",
+              };
+
+              console.log("Placing new trade after exiting last", key.id);
+              await newOrder(newOrderData);
+              console.log("Creating new trade log, after exiting last", key.id);
+              await TradeLog.create(newTradeLog);
+            } else {
+              const newTradeLog = {
+                brokerId: key.brokerId,
+                brokerKeyId: key.id,
+                userId: key.userId,
+                baseAssetId: dailyAsset.id,
+                asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
+                direction,
+                quantity: newOrderData.quantity,
+                type: "entry",
+              };
+
+              console.log("Placing fresh trade", key.id);
+              await newOrder(newOrderData);
+              console.log("Creating new trade log", key.id);
+              await TradeLog.create(newTradeLog);
             }
-          }
-
-          const newOrderData = {};
-          const exitOrderData = {};
-
-          newOrderData.exchange = symbol.exchange;
-          newOrderData.tradingsymbol = symbol.tradingsymbol;
-          newOrderData.quantity = noOfLots * symbol.lot_size;
-
-          if (lastTrade) {
-            exitOrderData.exchange = lastTrade.asset.split(":")[0];
-            exitOrderData.tradingsymbol = lastTrade.asset.split(":")[1];
-            exitOrderData.quantity = lastTrade.quantity;
-          }
-
-          if (lastTrade) {
-            if (lastTrade.direction === direction) continue;
-            await exitOrder(exitOrderData);
-            lastTrade.type = "exit";
-            await lastTrade.save();
-            const newTradeLog = {
-              brokerId: key.brokerId,
-              brokerKeyId: key.id,
-              userId: key.userId,
-              baseAssetId: dailyAsset.id,
-              asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
-              direction,
-              quantity: newOrderData.quantity,
-              type: "entry",
-            };
-
-            await newOrder(newOrderData);
-            await TradeLog.create(newTradeLog);
-          } else {
-            const newTradeLog = {
-              brokerId: key.brokerId,
-              brokerKeyId: key.id,
-              userId: key.userId,
-              baseAssetId: dailyAsset.id,
-              asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
-              direction,
-              quantity: newOrderData.quantity,
-              type: "entry",
-            };
-            await newOrder(newOrderData);
-            await TradeLog.create(newTradeLog);
+          } catch (e) {
+            console.log(e);
           }
         }
 
