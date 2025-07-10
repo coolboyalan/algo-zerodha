@@ -229,6 +229,13 @@ cron.schedule("* * * * * *", async () => {
         });
 
         let symbol;
+
+	if (direction === "CE"){
+		assetPrice+=500
+	}else if (direction === "PE"){
+		assetPrice-=500
+	}
+	      
         if (direction) {
           symbol = await getSpecificCachedOption(
             dailyAsset.name,
