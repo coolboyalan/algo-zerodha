@@ -135,18 +135,17 @@ cron.schedule("* * * * * *", async () => {
         const apiKey = adminKeys.apiKey;
         const accessToken = adminKeys.token;
 
-        console.log(true);
-
         const url = `https://api.kite.trade/instruments/historical/${instrumentToken}/${interval}?from=${encodeURIComponent(
           fromTime,
         )}&to=${encodeURIComponent(toTime)}&continuous=false`;
-        console.log(false);
         const response = await axios.get(url, {
           headers: {
             "X-Kite-Version": "3",
             Authorization: `token ${apiKey}:${accessToken}`,
           },
         });
+
+        console.log(true);
 
         const { data } = response.data;
 
