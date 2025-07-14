@@ -420,7 +420,8 @@ cron.schedule("* * * * * *", async () => {
               await key.save();
               continue;
             }
-            if (istMinute % 3 === 0 && second >= 10) continue;
+            if (second >= 10) continue;
+            if (istMinute % 3 !== 0) continue;
             if (signal === "No Action") continue;
 
             if (
