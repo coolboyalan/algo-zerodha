@@ -245,6 +245,7 @@ cron.schedule("* * * * * *", async () => {
         }
 
         for (const key of keys) {
+          console.log(key.id);
           try {
             const getLTP = async (instrument) => {
               try {
