@@ -48,8 +48,11 @@ function toKiteISTFormat(dateObj) {
 
   return `${yyyy}-${mm}-${dd} ${hh}:${min}:00`;
 }
+let isRunning = false;
 
 cron.schedule("* * * * * *", async () => {
+  if (isRunning) return;
+  isRunning = true;
   try {
     const istNow = new Date(
       new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
@@ -550,6 +553,8 @@ cron.schedule("* * * * * *", async () => {
     }
   } catch (e) {
     console.log(e);
+  } finally {
+    isRunning = false;
   }
 });
 
