@@ -123,7 +123,7 @@ cron.schedule("* * * * * *", async () => {
         }
       }
 
-      if (isInMarketRange && istMinute % 3 === 0 && second === 0) {
+      if (isInMarketRange && second % 10 === 0) {
         console.log(istNow);
         const toTime = toKiteISTFormat(istNow);
         const fromTime = toKiteISTFormat(
@@ -230,12 +230,12 @@ cron.schedule("* * * * * *", async () => {
 
         let symbol;
 
-	if (direction === "CE"){
-		assetPrice+=500
-	}else if (direction === "PE"){
-		assetPrice-=500
-	}
-	      
+        if (direction === "CE") {
+          assetPrice += 500;
+        } else if (direction === "PE") {
+          assetPrice -= 500;
+        }
+
         if (direction) {
           symbol = await getSpecificCachedOption(
             dailyAsset.name,
@@ -335,7 +335,7 @@ cron.schedule("* * * * * *", async () => {
             const pnl = await getTodaysPnL();
 
             const maxLoss = balance / 20;
-            const maxProfit = (balance / 10) ;
+            const maxProfit = balance / 10;
 
             const placeIntradayOrder = async ({
               exchange = "NSE",
@@ -420,6 +420,7 @@ cron.schedule("* * * * * *", async () => {
               await key.save();
               continue;
             }
+            if (istMinute % 3 === 0 && second >= 10) continue;
             if (signal === "No Action") continue;
 
             if (
