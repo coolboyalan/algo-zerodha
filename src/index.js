@@ -105,7 +105,7 @@ async function exitOpenTrades(keys) {
     );
 
     if (!lastTrade) {
-      if (key.status === false) continue;
+      if (!key.status) continue;
 
       key.status = false;
       console.log("Marking key as inactive, Closing time", key.id);
