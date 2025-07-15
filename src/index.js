@@ -50,6 +50,88 @@ function toKiteISTFormat(dateObj) {
 }
 let isRunning = false;
 
+async function exitOpenTrades(keys) {
+  for (const key of keys) {
+    const placeIntradayOrder = async ({
+      exchange = "NSE",
+      tradingsymbol,
+      transaction_type = "BUY", // or "SELL"
+      quantity = 1,
+    }) => {
+      try {
+        const data = qs.stringify({
+          tradingsymbol,
+          exchange,
+          transaction_type,
+          order_type: "MARKET",
+          quantity,
+          product: "MIS", // Intraday
+          validity: "DAY",
+        });
+
+        const headers = {
+          "X-Kite-Version": "3",
+          Authorization: `token ${key.apiKey}:${key.token}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        };
+
+        const response = await axios.post(
+          "https://api.kite.trade/orders/regular",
+          data,
+          { headers },
+        );
+
+        console.log("✅ Order placed:", response.data);
+        return response.data;
+      } catch (err) {
+        console.error("❌ Order error:", err.response?.data || err.message);
+        throw err;
+      }
+    };
+
+    async function newOrder(data) {
+      data.transaction_type = "BUY";
+      return await placeIntradayOrder(data);
+    }
+
+    async function exitOrder(data) {
+      data.transaction_type = "SELL";
+      return await placeIntradayOrder(data);
+    }
+
+    const lastTrade = await TradeLog.findDoc(
+      { brokerKeyId: key.id, type: "entry" },
+      { allowNull: true },
+    );
+
+    if (!lastTrade) {
+      if (key.status === false) continue;
+
+      key.status = false;
+      console.log("Marking key as inactive, Closing time", key.id);
+      await key.save();
+      continue;
+    }
+    const exitOrderData = {
+      exchange: lastTrade.asset.split(":")[0],
+      tradingsymbol: lastTrade.asset.split(":")[1],
+      quantity: lastTrade.quantity,
+    };
+    console.log("Exiting last trade, Closing time", key.id);
+    await exitOrder(exitOrderData);
+    lastTrade.type = "exit";
+    console.log("Updating last trade, Closing time", key.id);
+    await lastTrade.save();
+    key.status = false;
+    console.log(
+      "Marking key as inactive, after exiting last trade. Closing time",
+      key.id,
+    );
+    await key.save();
+    continue;
+  }
+}
+
 cron.schedule("* * * * * *", async () => {
   if (isRunning) return;
   isRunning = true;
@@ -61,7 +143,6 @@ cron.schedule("* * * * * *", async () => {
     const istHour = istNow.getHours();
     const istMinute = istNow.getMinutes();
     const second = istNow.getSeconds();
-
     const preRange =
       (istHour === 8 && istMinute >= 30) ||
       (istHour > 8 && istHour < 15) ||
@@ -70,7 +151,7 @@ cron.schedule("* * * * * *", async () => {
     const isInMarketRange =
       (istHour === 9 && istMinute >= 30) ||
       (istHour > 9 && istHour < 15) ||
-      (istHour === 15 && istMinute <= 12);
+      (istHour === 15 && istMinute <= 15);
 
     try {
       if (!preRange && !isInMarketRange) return;
@@ -124,6 +205,10 @@ cron.schedule("* * * * * *", async () => {
           adminKeys = admin[0];
           keys = responseKeys;
         }
+      }
+
+      if (istHour === 15 && istMinute === 15) {
+        return await exitOpenTrades(keys);
       }
 
       if (isInMarketRange && second % 10 === 0) {
