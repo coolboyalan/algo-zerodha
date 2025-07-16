@@ -344,7 +344,7 @@ cron.schedule("* * * * * *", async () => {
                   {
                     headers: {
                       "X-Kite-Version": "3",
-                      Authorization: `token ${key.apiKey}:${key.token}`,
+                      Authorization: `token ${apiKey}:${accessToken}`,
                     },
                     params: {
                       i: instrument, // e.g., 'NSE:RELIANCE'
