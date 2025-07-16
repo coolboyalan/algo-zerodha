@@ -425,8 +425,8 @@ cron.schedule("* * * * * *", async () => {
             }
             const pnl = await getTodaysPnL();
 
-            const maxLoss = balance / 20;
-            const maxProfit = balance / 10;
+            const maxLoss = (balance / 100) * 4;
+            const maxProfit = (balance / 100) * 8;
 
             const placeIntradayOrder = async ({
               exchange = "NSE",
