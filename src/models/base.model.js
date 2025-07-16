@@ -1,6 +1,7 @@
 import { Model } from "sequelize";
 import httpStatus from "http-status";
 import sequelize from "#configs/database";
+import AppError from "#utils/appError";
 
 class BaseModel extends Model {
   static excludedBranchModels = ["Branch", "City", "State", "Country", "Auth"];
