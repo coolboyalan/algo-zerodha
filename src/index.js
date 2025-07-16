@@ -665,9 +665,9 @@ server.post("/stop/:id?", async (req, res, next) => {
           },
         });
     await exitOpenTrades(keys.length ? keys : [keys]);
-    sendResponse(httpStatus.OK, res, null, "Deactivated for the day");
+    res.status(200).json({ status: true, message: "Deactivated for the day" });
   } catch (e) {
-    sendResponse(500, res, null, "Internal Error");
+    res.status(400).json({ status: true, message: "Failed" });
   }
 });
 
