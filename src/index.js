@@ -664,9 +664,15 @@ server.post("/stop/:id?", async (req, res, next) => {
             status: true,
           },
         });
-    await exitOpenTrades(keys.length ? keys : [keys]);
+
+    keys = Array.isArray(keys) ? keys : [keys];
+
+    if (keys.length) {
+      await exitOpenTrades(Array.isArray(keys) ? keys : [keys]);
+    }
     res.status(200).json({ status: true, message: "Deactivated for the day" });
   } catch (e) {
+    console.log(e);
     res.status(400).json({ status: true, message: "Failed" });
   }
 });
