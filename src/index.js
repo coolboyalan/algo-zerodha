@@ -321,9 +321,9 @@ cron.schedule("* * * * * *", async () => {
         let symbol;
 
         if (direction === "CE") {
-          assetPrice += 500;
+          assetPrice += 300;
         } else if (direction === "PE") {
-          assetPrice -= 500;
+          assetPrice -= 300;
         }
 
         if (direction) {
