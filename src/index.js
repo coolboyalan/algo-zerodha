@@ -421,7 +421,7 @@ cron.schedule("* * * * * *", async () => {
 
             if (direction) {
               ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
-              noOfLots = 1 ?? Math.floor(usableFunds / (ltp * symbol.lot_size));
+              noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
             }
             const pnl = await getTodaysPnL();
 
