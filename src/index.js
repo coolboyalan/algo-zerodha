@@ -215,11 +215,11 @@ cron.schedule("* * * * * *", async () => {
         console.log(istNow);
         const toTime = toKiteISTFormat(istNow);
         const fromTime = toKiteISTFormat(
-          new Date(istNow.getTime() - 3 * 60 * 1000),
+          new Date(istNow.getTime() - 5 * 60 * 1000),
         );
 
         const instrumentToken = dailyAsset.zerodhaToken;
-        const interval = "3minute";
+        const interval = "5minute";
         const apiKey = adminKeys.apiKey;
         const accessToken = adminKeys.token;
 
@@ -512,7 +512,7 @@ cron.schedule("* * * * * *", async () => {
               continue;
             }
             if (second >= 10) continue;
-            if (istMinute % 3 !== 0) continue;
+            if (istMinute % 5 !== 0) continue;
             if (signal === "No Action") continue;
 
             if (
