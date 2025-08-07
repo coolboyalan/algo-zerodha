@@ -212,7 +212,6 @@ cron.schedule("* * * * * *", async () => {
       }
 
       if (isInMarketRange && second % 10 === 0) {
-        console.log(istNow);
         const toTime = toKiteISTFormat(istNow);
         const fromTime = toKiteISTFormat(
           new Date(istNow.getTime() - 5 * 60 * 1000),
@@ -226,8 +225,6 @@ cron.schedule("* * * * * *", async () => {
         const url = `https://api.kite.trade/instruments/historical/${instrumentToken}/${interval}?from=${encodeURIComponent(
           fromTime,
         )}&to=${encodeURIComponent(toTime)}&continuous=false`;
-
-        console.log(apiKey, accessToken);
 
         const response = await axios.get(url, {
           headers: {
@@ -334,8 +331,9 @@ cron.schedule("* * * * * *", async () => {
           );
         }
 
+	console.log({istNow,price,direction,signal})
+
         for (const key of keys) {
-          console.log(key.id);
           try {
             const getLTP = async (instrument) => {
               try {
