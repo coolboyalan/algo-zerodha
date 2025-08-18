@@ -318,9 +318,9 @@ cron.schedule("* * * * * *", async () => {
         let symbol;
 
         if (direction === "CE") {
-          assetPrice += 100;
+          assetPrice += 400;
         } else if (direction === "PE") {
-          assetPrice -= 100;
+          assetPrice -= 400;
         }
 
         if (direction) {
@@ -331,7 +331,7 @@ cron.schedule("* * * * * *", async () => {
           );
         }
 
-	console.log({istNow,price,direction,signal})
+        console.log({ istNow, price, direction, signal });
 
         for (const key of keys) {
           try {
