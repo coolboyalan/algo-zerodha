@@ -1,25 +1,26 @@
 import cron from "node-cron";
-import { main, getSpecificCachedOption } from "#utils/assetChecker";
-import env from "#configs/env";
-import Trade from "#models/trade";
-import qs from "qs";
+import express from "express";
 import axios from "axios";
 import { getISTMidnightFakeUTCString } from "#utils/dayChecker";
 import sequelize from "#configs/database";
+import { main, getSpecificCachedOption } from "#utils/assetChecker";
 import BrokerKey from "#models/brokerKey";
 import Broker from "#models/broker";
-import express from "express";
 import TradeLog from "#models/tradeLog";
+import qs from "qs";
+import logger, { logInfo, logWarn, logError } from "./utils/logger.js";
 
-main();
-
+// Bootstrap
 try {
   await sequelize.authenticate();
-  console.log("connected");
+  logInfo("Database connected", { dialect: sequelize.getDialect && sequelize.getDialect() });
 } catch (e) {
-  console.log("Cannot connect");
-  process.exit();
+  logError("Database connection failed", e);
+  process.exit(1);
 }
+await main();
+
+const server = express();
 
 let dailyAsset = null;
 let keys = null;
@@ -36,9 +37,7 @@ const dayMap = {
 
 // Helper to format to Kite-compatible IST timestamp: "YYYY-MM-DD HH:mm:00"
 function toKiteISTFormat(dateObj) {
-  const local = new Date(
-    dateObj.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
-  );
+  const local = new Date(dateObj.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
   const yyyy = local.getFullYear();
   const mm = String(local.getMonth() + 1).padStart(2, "0");
   const dd = String(local.getDate()).padStart(2, "0");
@@ -47,15 +46,15 @@ function toKiteISTFormat(dateObj) {
   return `${yyyy}-${mm}-${dd} ${hh}:${min}:00`;
 }
 
-let isRunning = false;
-
-async function exitOpenTrades(keys) {
-  for (const key of keys) {
+async function exitOpenTrades(targetKeys) {
+  for (let key of targetKeys) {
     const placeIntradayOrder = async ({
       exchange = "NSE",
       tradingsymbol,
-      transaction_type = "BUY", // or "SELL"
+      transaction_type = "BUY",
       quantity = 1,
+      accessToken = key.token,
+      apiKey = key.apiKey,
     }) => {
       try {
         const data = qs.stringify({
@@ -64,746 +63,181 @@ async function exitOpenTrades(keys) {
           transaction_type,
           order_type: "MARKET",
           quantity,
-          product: "MIS", // Intraday
+          product: "MIS",
           validity: "DAY",
         });
         const headers = {
           "X-Kite-Version": "3",
-          Authorization: `token ${key.apiKey}:${key.token}`,
+          Authorization: `token ${apiKey}:${accessToken}`,
           "Content-Type": "application/x-www-form-urlencoded",
         };
-        const response = await axios.post(
-          "https://api.kite.trade/orders/regular",
-          data,
-          { headers },
-        );
-        console.log("✅ Order placed:", response.data);
+        const response = await axios.post("https://api.kite.trade/orders/regular", data, { headers });
+        logInfo("Order placed (exitOpenTrades)", {
+          brokerKeyId: key.id,
+          side: transaction_type,
+          qty: quantity,
+          tradingsymbol,
+          order_id: response?.data?.data?.order_id,
+        });
         return response.data;
       } catch (err) {
-        console.error("❌ Order error:", err.response?.data || err.message);
-        throw err;
+        logError("Order placement failed (exitOpenTrades)", err, {
+          brokerKeyId: key.id,
+          tradingsymbol,
+          side: transaction_type,
+          qty: quantity,
+        });
+        // proceed regardless to deactivate
       }
     };
 
-    async function newOrder(data) {
+    const newOrder = async (data) => {
       data.transaction_type = "BUY";
       return await placeIntradayOrder(data);
-    }
-
-    async function exitOrder(data) {
+    };
+    const exitOrder = async (data) => {
       data.transaction_type = "SELL";
       return await placeIntradayOrder(data);
-    }
-
-    const lastTrade = await TradeLog.findDoc(
-      { brokerKeyId: key.id, type: "entry" },
-      { allowNull: true },
-    );
-
-    if (!lastTrade) {
-      if (!key.status) continue;
-      key.status = false;
-      console.log("Marking key as inactive, Closing time", key.id);
-      await key.save();
-      continue;
-    }
-
-    const exitOrderData = {
-      exchange: lastTrade.asset.split(":"),
-      tradingsymbol: lastTrade.asset.split(":")[11],
-      quantity: lastTrade.quantity,
     };
 
-    console.log("Exiting last trade, Closing time", key.id);
-    await exitOrder(exitOrderData);
-    lastTrade.type = "exit";
-    console.log("Updating last trade, Closing time", key.id);
-    await lastTrade.save();
-
-    key.status = false;
-    console.log(
-      "Marking key as inactive, after exiting last trade. Closing time",
-      key.id,
-    );
-    await key.save();
-    continue;
+    try {
+      const lastTrade = await TradeLog.findDoc({ brokerKeyId: key.id, type: "entry" }, { allowNull: true });
+      if (!lastTrade) {
+        if (!key.status) continue;
+        key.status = false;
+        await key.save();
+        logInfo("Marking key as inactive (no open trade at close)", { brokerKeyId: key.id });
+        continue;
+      }
+      const exitOrderData = {
+        exchange: lastTrade.asset.split(":"),
+        tradingsymbol: lastTrade.asset.split(":")[11] || lastTrade.asset.split(":")[12],
+        quantity: lastTrade.quantity,
+        accessToken: key.token,
+        apiKey: key.apiKey,
+      };
+      logInfo("Exiting last trade, closing time", { brokerKeyId: key.id, asset: lastTrade.asset, qty: lastTrade.quantity });
+      await exitOrder(exitOrderData);
+      lastTrade.type = "exit";
+      await lastTrade.save();
+      key.status = false;
+      await key.save();
+      logInfo("Marked key inactive after exiting last trade", { brokerKeyId: key.id });
+    } catch (e) {
+      logError("exitOpenTrades failed", e, { brokerKeyId: key?.id });
+    }
   }
 }
 
-cron.schedule("* * * * * *", async () => {
-  if (isRunning) return;
-  isRunning = true;
-  try {
-    const istNow = new Date(
-      new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
-    );
-    const istHour = istNow.getHours();
-    const istMinute = istNow.getMinutes();
-    const second = istNow.getSeconds();
+// Flags for two lightweight crons
+let isRunning3Min = false;
+let isRunning5Min = false;
 
-    const preRange =
-      (istHour === 8 && istMinute >= 30) ||
-      (istHour > 8 && istHour < 15) ||
-      (istHour === 15 && istMinute <= 30);
+// Shared trading logic (small cron pattern)
+async function runTradingLogic({ intervalMinutes, intervalString }) {
+  const istNow = new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const istHour = istNow.getHours();
+  const istMinute = istNow.getMinutes();
+  const second = istNow.getSeconds();
 
-    const isInMarketRange =
-      (istHour === 9 && istMinute >= 30) ||
-      (istHour > 9 && istHour < 15) ||
-      (istHour === 15 && istMinute <= 15);
+  const preRange =
+    (istHour === 8 && istMinute >= 30) || (istHour > 8 && istHour < 15) || (istHour === 15 && istMinute <= 30);
+  const isInMarketRange =
+    (istHour === 9 && istMinute >= 30) || (istHour > 9 && istHour < 15) || (istHour === 15 && istMinute <= 15);
 
-    try {
-      if (!preRange && !isInMarketRange) return;
+  if (!preRange && !isInMarketRange) return;
 
-      if (preRange) {
-        if (!dailyLevels) {
-          const [dailyData] = await sequelize.query(`
-SELECT * FROM "DailyLevels" WHERE "forDay" = '${getISTMidnightFakeUTCString()}'
-`);
-          dailyLevels = dailyData;
-        }
-
-        if (!dailyAsset) {
-          const day = dayMap[istNow.getDay()];
-          const [response] = await sequelize.query(
-            `SELECT "name", "zerodhaToken", "Assets"."id" FROM "DailyAssets"
-INNER JOIN "Assets" ON "DailyAssets"."assetId" = "Assets"."id"
-WHERE "day" = '${day}'`,
-          );
-          if (!response.length) {
-            return console.log("❌ No asset available for today");
-          }
-          dailyAsset = response;
-        }
-
-        if (!keys || !adminKeys || (istMinute % 1 === 0 && second % 40 === 0)) {
-          const responseKeys = await BrokerKey.findAll({
-            include: [
-              {
-                model: Broker,
-                where: {
-                  name: "Zerodha",
-                },
-              },
-            ],
-            where: {
-              status: true,
-            },
-          });
-
-          const [admin] = await sequelize.query(
-            `SELECT * FROM "BrokerKeys"
-INNER JOIN "Users" ON "BrokerKeys"."userId" = "Users"."id"
-INNER JOIN "Brokers" ON "BrokerKeys"."brokerId" = "Brokers"."id"
-WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'
-`,
-          );
-          adminKeys = admin;
-          keys = responseKeys;
-        }
-
-        if (istHour === 15 && istMinute === 15) {
-          return await exitOpenTrades(keys);
-        }
-      }
-
-      if (isInMarketRange && second % 10 === 0) {
-        const toTime = toKiteISTFormat(istNow);
-        const fromTime = toKiteISTFormat(
-          new Date(istNow.getTime() - 3 * 60 * 1000),
-        );
-
-        const instrumentToken = dailyAsset.zerodhaToken;
-        const interval = "3minute";
-        const apiKey = adminKeys.apiKey;
-        const accessToken = adminKeys.token;
-
-        const url = `https://api.kite.trade/instruments/historical/${instrumentToken}/${interval}?from=${encodeURIComponent(
-          fromTime,
-        )}&to=${encodeURIComponent(toTime)}&continuous=false`;
-
-        const response = await axios.get(url, {
-          headers: {
-            "X-Kite-Version": "3",
-            Authorization: `token ${apiKey}:${accessToken}`,
-          },
-        });
-
-        const { data } = response.data;
-
-        if (
-          !data ||
-          !Array.isArray(data.candles) ||
-          data.candles.length === 0
-        ) {
-          console.log("⚠️ No candle data available");
-          return;
-        }
-
-        const latestCandle = data.candles[data.candles.length - 1];
-        const price = latestCandle[12]; // close price
-
-        if (price === null || price === undefined) {
-          return console.log("⚠️ Invalid Price");
-        }
-
-        const { bc, tc, r1, r2, r3, r4, s1, s2, s3, s4 } = dailyLevels;
-        const BUFFER = dailyLevels.buffer;
-
-        let signal = "No Action";
-        let reason = "Price is in a neutral zone.";
-        let direction;
-        let assetPrice;
-        let lastTrade;
-
-        if (price % 100 > 50) {
-          assetPrice = parseInt(price / 100) * 100 + 100;
-        } else {
-          assetPrice = parseInt(price / 100) * 100;
-        }
-
-        // If price is above TC and within TC + BUFFER, Buy
-        if (price >= tc && price <= tc + BUFFER) {
-          direction = "CE";
-          signal = "Buy";
-          reason = "Price is above TC within buffer.";
-          // If price is below BC and within BC - BUFFER, Sell
-        } else if (price <= bc && price >= bc - BUFFER) {
-          direction = "PE";
-          signal = "Sell";
-          reason = "Price is below BC within buffer.";
-          // If price is between TC and BC, No Action
-        } else if (price < tc && price > bc) {
-          signal = "Exit";
-          reason = "Price is within CPR range.";
-        }
-
-        const levelsMap = { r1, r2, r3, r4, s1, s2, s3, s4 };
-        Object.entries(levelsMap).forEach(([levelName, level]) => {
-          if (price > level && price <= level + BUFFER) {
-            signal = "Buy";
-            reason = `Price is above ${levelName} (${level}) within buffer.`;
-            direction = "CE";
-          } else if (price < level && price >= level - BUFFER) {
-            signal = "Sell";
-            reason = `Price is below ${levelName} (${level}) within buffer.`;
-            direction = "PE";
-          }
-        });
-
-        const innerLevelMap = { r1, r2, r3, r4, s1, s2, s3, s4, tc, bc };
-        Object.entries(innerLevelMap).find(([levelName, level]) => {
-          if (signal === "No Action") {
-            if (data.close > level && data.open < level) {
-              signal = "PE Exit";
-              reason = `Price crossed the level ${levelName}`;
-              return true;
-            } else if (data.close < level && data.open > level) {
-              signal = "CE Exit";
-              reason = `Price crossed the level ${levelName}`;
-              return true;
-            }
-          }
-          return false;
-        });
-
-        let symbol;
-
-        if (direction === "CE") {
-          assetPrice += 600;
-        } else if (direction === "PE") {
-          assetPrice -= 600;
-        }
-
-        if (direction) {
-          symbol = await getSpecificCachedOption(
-            dailyAsset.name,
-            assetPrice,
-            direction,
-          );
-        }
-
-        console.log({ istNow, price, direction, signal });
-
-        for (const key of keys) {
-          if (key.timeFrame !== 3) continue;
-
-          try {
-            const getLTP = async (instrument) => {
-              try {
-                const res = await axios.get(
-                  "https://api.kite.trade/quote/ltp",
-                  {
-                    headers: {
-                      "X-Kite-Version": "3",
-                      Authorization: `token ${apiKey}:${accessToken}`,
-                    },
-                    params: {
-                      i: instrument, // e.g., 'NSE:RELIANCE'
-                    },
-                  },
-                );
-                const ltp = res.data.data[instrument].last_price;
-                return ltp;
-              } catch (err) {
-                console.error(
-                  "❌ Error fetching LTP:",
-                  err.response?.data || err.message,
-                );
-                throw err;
-              }
-            };
-
-            const getInitialDayBalance = async () => {
-              try {
-                const res = await axios.get(
-                  "https://api.kite.trade/user/margins",
-                  {
-                    headers: {
-                      "X-Kite-Version": "3",
-                      Authorization: `token ${key.apiKey}:${key.token}`,
-                    },
-                  },
-                );
-                const openingBalance =
-                  res.data.data.equity.available.opening_balance;
-                return openingBalance;
-              } catch (err) {
-                console.error(
-                  "❌ Error fetching initial day balance:",
-                  err.response?.data || err.message,
-                );
-                throw err;
-              }
-            };
-
-            const getTodaysPnL = async () => {
-              try {
-                const res = await axios.get(
-                  "https://api.kite.trade/portfolio/positions",
-                  {
-                    headers: {
-                      "X-Kite-Version": "3",
-                      Authorization: `token ${key.apiKey}:${key.token}`,
-                    },
-                  },
-                );
-                const dayPositions = res.data.data.day || [];
-                const totalPnL = dayPositions.reduce(
-                  (sum, pos) => sum + pos.pnl,
-                  0,
-                );
-                return totalPnL;
-              } catch (err) {
-                console.error(
-                  "❌ Error fetching today's P&L:",
-                  err.response?.data || err.message,
-                );
-                throw err;
-              }
-            };
-
-            const balance = await getInitialDayBalance();
-            const usableFunds = (balance / 100) * 10;
-
-            let ltp;
-            let noOfLots;
-
-            if (direction) {
-              ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
-              noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
-            }
-
-            const pnl = await getTodaysPnL();
-            const maxLoss = (balance / 100) * 4;
-            const maxProfit = (balance / 100) * 8;
-
-            const placeIntradayOrder = async ({
-              exchange = "NSE",
-              tradingsymbol,
-              transaction_type = "BUY", // or "SELL"
-              quantity = 1,
-            }) => {
-              try {
-                const data = qs.stringify({
-                  tradingsymbol,
-                  exchange,
-                  transaction_type,
-                  order_type: "MARKET",
-                  quantity,
-                  product: "MIS", // Intraday
-                  validity: "DAY",
-                });
-                const headers = {
-                  "X-Kite-Version": "3",
-                  Authorization: `token ${key.apiKey}:${key.token}`,
-                  "Content-Type": "application/x-www-form-urlencoded",
-                };
-                const response = await axios.post(
-                  "https://api.kite.trade/orders/regular",
-                  data,
-                  { headers },
-                );
-                console.log("✅ Order placed:", response.data);
-                return response.data;
-              } catch (err) {
-                console.error(
-                  "❌ Order error:",
-                  err.response?.data || err.message,
-                );
-                throw err;
-              }
-            };
-
-            async function newOrder(data) {
-              data.transaction_type = "BUY";
-              return await placeIntradayOrder(data);
-            }
-
-            async function exitOrder(data) {
-              data.transaction_type = "SELL";
-              return await placeIntradayOrder(data);
-            }
-
-            const lastTrade = await TradeLog.findDoc(
-              { brokerKeyId: key.id, type: "entry" },
-              { allowNull: true },
-            );
-
-            if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
-              if (!lastTrade) {
-                key.status = false;
-                console.log(
-                  "Marking key as inactive, daily limit reached",
-                  key.id,
-                );
-                await key.save();
-                continue;
-              }
-
-              const exitOrderData = {
-                exchange: lastTrade.asset.split(":"),
-                tradingsymbol: lastTrade.asset.split(":")[11],
-                quantity: lastTrade.quantity,
-              };
-              console.log("Exiting last trade, daily limit reached", key.id);
-              await exitOrder(exitOrderData);
-
-              lastTrade.type = "exit";
-              console.log("Updating last trade, marking as exited", key.id);
-              await lastTrade.save();
-
-              key.status = false;
-              console.log(
-                "Marking key as inactive, after exiting last trade",
-                key.id,
-              );
-              await key.save();
-              continue;
-            }
-
-            if (second >= 10) continue;
-            if (istMinute % 3 !== 0) continue;
-            if (signal === "No Action") continue;
-
-            if (
-              signal === "Exit" ||
-              signal === "PE Exit" ||
-              signal === "CE Exit"
-            ) {
-              if (!lastTrade) continue;
-
-              const exitOrderData = {
-                exchange: lastTrade.asset.split(":"),
-                tradingsymbol: lastTrade.asset.split(":")[11],
-                quantity: lastTrade.quantity,
-              };
-
-              if (signal === "PE Exit") {
-                if (lastTrade.direction === "PE") {
-                  console.log(
-                    "Signal PE EXIT, lastrade PE, exiting trade",
-                    key.id,
-                  );
-                  await exitOrder(exitOrderData);
-                  lastTrade.type = "exit";
-                  console.log("Updating last trade", key.id);
-                  await lastTrade.save();
-                  continue;
-                }
-
-                continue;
-              } else if (signal === "CE Exit") {
-                if (lastTrade.direction === "CE") {
-                  console.log(
-                    "Signal CE EXIT, lasttrade CE, exiting trade",
-                    key.id,
-                  );
-                  await exitOrder(exitOrderData);
-                  lastTrade.type = "exit";
-                  console.log("Updating last trade", key.id);
-                  await lastTrade.save();
-                  continue;
-                }
-
-                continue;
-              }
-
-              if (signal === "Exit") {
-                console.log("Signal Exit, Exiting last trade", key.id);
-                await exitOrder(exitOrderData);
-                lastTrade.type = "exit";
-                console.log("Updating last trade", key.id);
-                await lastTrade.save();
-                continue;
-              }
-            }
-
-            const newOrderData = {};
-            const exitOrderData = {};
-
-            newOrderData.exchange = symbol.exchange;
-            newOrderData.tradingsymbol = symbol.tradingsymbol;
-            newOrderData.quantity = noOfLots * symbol.lot_size;
-
-            if (lastTrade) {
-              exitOrderData.exchange = lastTrade.asset.split(":");
-              exitOrderData.tradingsymbol = lastTrade.asset.split(":")[11];
-              exitOrderData.quantity = lastTrade.quantity;
-            }
-
-            if (lastTrade) {
-              if (lastTrade.direction === direction) continue;
-
-              console.log("Changing trade, exiting last trade", key.id);
-              await exitOrder(exitOrderData);
-
-              lastTrade.type = "exit";
-              console.log("Updating last trade", key.id);
-              await lastTrade.save();
-
-              const newTradeLog = {
-                brokerId: key.brokerId,
-                brokerKeyId: key.id,
-                userId: key.userId,
-                baseAssetId: dailyAsset.id,
-                asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
-                direction,
-                quantity: newOrderData.quantity,
-                type: "entry",
-              };
-
-              console.log("Placing new trade after exiting last", key.id);
-              await newOrder(newOrderData);
-
-              console.log("Creating new trade log, after exiting last", key.id);
-              await TradeLog.create(newTradeLog);
-            } else {
-              const newTradeLog = {
-                brokerId: key.brokerId,
-                brokerKeyId: key.id,
-                userId: key.userId,
-                baseAssetId: dailyAsset.id,
-                asset: `${symbol.exchange}:${symbol.tradingsymbol}`,
-                direction,
-                quantity: newOrderData.quantity,
-                type: "entry",
-              };
-
-              console.log("Placing fresh trade", key.id);
-              await newOrder(newOrderData);
-
-              console.log("Creating new trade log", key.id);
-              await TradeLog.create(newTradeLog);
-            }
-          } catch (e) {
-            console.log(e);
-          }
-        }
-      }
-    } catch (e) {
-      if (axios.isAxiosError(e)) {
-        console.error("❌ Cron Error:", e.message);
-        if (e.response) {
-          console.error("📉 Response Data:", e.response.data);
-          console.error("📊 Status Code:", e.response.status);
-        }
-      } else {
-        console.error("❌ Unknown Error:", e.message);
-      }
+  // Preload shared state
+  if (preRange) {
+    if (!dailyLevels) {
+      const [dailyData] = await sequelize.query(
+        `SELECT * FROM "DailyLevels" WHERE "forDay" = '${getISTMidnightFakeUTCString()}'`
+      );
+      dailyLevels = Array.isArray(dailyData) ? dailyData : dailyData;
+      logInfo("Loaded dailyLevels", { present: !!dailyLevels });
     }
-  } catch (e) {
-    console.log(e);
-  } finally {
-    isRunning = false;
+    if (!dailyAsset) {
+      const day = dayMap[istNow.getDay()];
+      const [response] = await sequelize.query(
+        `SELECT "name", "zerodhaToken","Assets"."id" FROM "DailyAssets"
+         INNER JOIN "Assets" ON "DailyAssets"."assetId" = "Assets"."id"
+         WHERE "day" = '${day}'`
+      );
+      if (!response.length) {
+        logWarn("❌ No asset available for today", { day });
+        return;
+      }
+      dailyAsset = response;
+      logInfo("Loaded dailyAsset", { name: dailyAsset?.name, token: dailyAsset?.zerodhaToken });
+    }
+    if (!keys || !adminKeys || (istMinute % 1 === 0 && second % 40 === 0)) {
+      const responseKeys = await BrokerKey.findAll({
+        include: [{ model: Broker, where: { name: "Zerodha" } }],
+        where: { status: true },
+      });
+      const [admin] = await sequelize.query(
+        `SELECT * FROM "BrokerKeys"
+       INNER JOIN "Users" ON "BrokerKeys"."userId" = "Users"."id"
+       INNER JOIN "Brokers" ON "BrokerKeys"."brokerId" = "Brokers"."id"
+       WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`
+      );
+      adminKeys = Array.isArray(admin) ? admin : admin;
+      keys = responseKeys;
+      logInfo("Refreshed keys/adminKeys", { keysCount: Array.isArray(keys) ? keys.length : 0, hasAdmin: !!adminKeys });
+    }
   }
-});
 
-const server = express();
-
-server.post("/stop/:id?", async (req, res, next) => {
-  try {
-    const { id } = req.params;
-
-    let keys;
-
-    keys = id
-      ? await BrokerKey.findDocById(id)
-      : await BrokerKey.findAll({
-          include: [
-            {
-              model: Broker,
-              where: {
-                name: "Zerodha",
-              },
-            },
-          ],
-          where: {
-            status: true,
-          },
-        });
-
-    keys = Array.isArray(keys) ? keys : [keys];
-
-    if (keys.length) {
-      await exitOpenTrades(Array.isArray(keys) ? keys : [keys]);
-    }
-
-    res.status(200).json({ status: true, message: "Deactivated for the day" });
-  } catch (e) {
-    console.log(e);
-    res.status(400).json({ status: true, message: "Failed" });
+  // Hard exit time
+  if (istHour === 15 && istMinute === 15) {
+    logInfo("Hard exit time — exiting open trades");
+    return await exitOpenTrades(keys || []);
   }
-});
 
-server.listen(3002);
-
-// -------------------- 5-MINUTE CRON (ADDED, NON-INTRUSIVE) --------------------
-// Runs independently. Uses:
-// - timeframe filter: key.timeFrame === 5
-// - historical interval: 5minute
-// - executes only at 5-min boundaries (minute % 5 === 0) within first 10 seconds
-// - reuses the same DB state and helpers as the 3-minute flow
-let isRunning5 = false;
-
-cron.schedule("* * * * * *", async () => {
-  if (isRunning5) return;
-  isRunning5 = true;
-
-  try {
-    const istNow = new Date(
-      new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
-    );
-    const istHour = istNow.getHours();
-    const istMinute = istNow.getMinutes();
-    const second = istNow.getSeconds();
-
-    const preRange =
-      (istHour === 8 && istMinute >= 30) ||
-      (istHour > 8 && istHour < 15) ||
-      (istHour === 15 && istMinute <= 30);
-
-    const isInMarketRange =
-      (istHour === 9 && istMinute >= 30) ||
-      (istHour > 9 && istHour < 15) ||
-      (istHour === 15 && istMinute <= 15);
-
-    if (!preRange && !isInMarketRange) return;
-
-    // Preload shared state (same as 3m)
-    if (preRange) {
-      if (!dailyLevels) {
-        const [dailyData] = await sequelize.query(`
-SELECT * FROM "DailyLevels" WHERE "forDay" = '${getISTMidnightFakeUTCString()}'
-`);
-        dailyLevels = dailyData;
-      }
-
-      if (!dailyAsset) {
-        const day = dayMap[istNow.getDay()];
-        const [response] = await sequelize.query(
-          `SELECT "name", "zerodhaToken", "Assets"."id" FROM "DailyAssets"
-INNER JOIN "Assets" ON "DailyAssets"."assetId" = "Assets"."id"
-WHERE "day" = '${day}'`,
-        );
-        if (!response.length) {
-          console.log("❌ No asset available for today");
-          return;
-        }
-        dailyAsset = response;
-      }
-
-      if (!keys || !adminKeys || (istMinute % 1 === 0 && second % 40 === 0)) {
-        const responseKeys = await BrokerKey.findAll({
-          include: [
-            {
-              model: Broker,
-              where: { name: "Zerodha" },
-            },
-          ],
-          where: { status: true },
-        });
-
-        const [admin] = await sequelize.query(
-          `SELECT * FROM "BrokerKeys"
-INNER JOIN "Users" ON "BrokerKeys"."userId" = "Users"."id"
-INNER JOIN "Brokers" ON "BrokerKeys"."brokerId" = "Brokers"."id"
-WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`,
-        );
-
-        adminKeys = admin;
-        keys = responseKeys;
-      }
-
-      // Hard exit time
-      if (istHour === 15 && istMinute === 15) {
-        // Reuse existing exit logic
-        return await exitOpenTrades(keys);
-      }
-    }
-
-    // Only evaluate on 5-minute boundaries, and give a small buffer
-    if (!(isInMarketRange && istMinute % 5 === 0 && second < 10)) return;
-
+  // Low cadence fetch; minute/second guards applied later
+  if (isInMarketRange && second % 10 === 0) {
     const toTime = toKiteISTFormat(istNow);
-    const fromTime = toKiteISTFormat(
-      new Date(istNow.getTime() - 5 * 60 * 1000),
-    );
-
+    const fromTime = toKiteISTFormat(new Date(istNow.getTime() - intervalMinutes * 60 * 1000));
     const instrumentToken = dailyAsset.zerodhaToken;
-    const interval = "5minute"; // Kite historical interval for 5m
+    const interval = intervalString;
     const apiKey = adminKeys.apiKey;
     const accessToken = adminKeys.token;
 
     const url = `https://api.kite.trade/instruments/historical/${instrumentToken}/${interval}?from=${encodeURIComponent(
-      fromTime,
+      fromTime
     )}&to=${encodeURIComponent(toTime)}&continuous=false`;
 
-    const response = await axios.get(url, {
-      headers: {
-        "X-Kite-Version": "3",
-        Authorization: `token ${apiKey}:${accessToken}`,
-      },
-    });
-
-    const { data } = response.data;
-
-    if (!data || !Array.isArray(data.candles) || data.candles.length === 0) {
-      console.log("⚠️ No candle data available");
+    let dataObj;
+    try {
+      const response = await axios.get(url, {
+        headers: {
+          "X-Kite-Version": "3",
+          Authorization: `token ${apiKey}:${accessToken}`,
+        },
+      });
+      dataObj = response?.data?.data;
+    } catch (e) {
+      logError("Historical data fetch failed", e, { instrumentToken, interval, fromTime, toTime });
       return;
     }
 
-    const latestCandle = data.candles[data.candles.length - 1];
-    const price = latestCandle[12];
+    if (!dataObj || !Array.isArray(dataObj.candles) || dataObj.candles.length === 0) {
+      logWarn("⚠️ No candle data available", { instrumentToken, interval, fromTime, toTime });
+      return;
+    }
 
+    const latestCandle = dataObj.candles[dataObj.candles.length - 1];
+    // Kite candles: [time, open, high, low, close, volume]
+    const price = latestCandle?.[13];
     if (price === null || price === undefined) {
-      return console.log("⚠️ Invalid Price");
+      logWarn("⚠️ Invalid Price", { latestCandle });
+      return;
     }
 
     const { bc, tc, r1, r2, r3, r4, s1, s2, s3, s4 } = dailyLevels;
     const BUFFER = dailyLevels.buffer;
 
     let signal = "No Action";
-    let reason = "Price is in a neutral zone.";
+    let reason = "Neutral zone";
     let direction;
     let assetPrice;
 
@@ -816,83 +250,98 @@ WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`,
     if (price >= tc && price <= tc + BUFFER) {
       direction = "CE";
       signal = "Buy";
-      reason = "Price is above TC within buffer.";
+      reason = "Above TC within buffer";
     } else if (price <= bc && price >= bc - BUFFER) {
       direction = "PE";
       signal = "Sell";
-      reason = "Price is below BC within buffer.";
+      reason = "Below BC within buffer";
     } else if (price < tc && price > bc) {
       signal = "Exit";
-      reason = "Price is within CPR range.";
+      reason = "Inside CPR";
     }
 
     const levelsMap = { r1, r2, r3, r4, s1, s2, s3, s4 };
     Object.entries(levelsMap).forEach(([levelName, level]) => {
       if (price > level && price <= level + BUFFER) {
         signal = "Buy";
-        reason = `Price is above ${levelName} (${level}) within buffer.`;
+        reason = `Above ${levelName} within buffer`;
         direction = "CE";
       } else if (price < level && price >= level - BUFFER) {
         signal = "Sell";
-        reason = `Price is below ${levelName} (${level}) within buffer.`;
+        reason = `Below ${levelName} within buffer`;
         direction = "PE";
       }
     });
 
-    const dataOHLC = { open: latestCandle[11], close: latestCandle[12] };
     const innerLevelMap = { r1, r2, r3, r4, s1, s2, s3, s4, tc, bc };
+    const open = latestCandle?.[11];
+    const close = latestCandle?.[13];
     Object.entries(innerLevelMap).find(([levelName, level]) => {
       if (signal === "No Action") {
-        if (dataOHLC.close > level && dataOHLC.open < level) {
+        if (close > level && open < level) {
           signal = "PE Exit";
-          reason = `Price crossed the level ${levelName}`;
+          reason = `Crossed ${levelName}`;
           return true;
-        } else if (dataOHLC.close < level && dataOHLC.open > level) {
+        }
+        if (close < level && open > level) {
           signal = "CE Exit";
-          reason = `Price crossed the level ${levelName}`;
+          reason = `Crossed ${levelName}`;
           return true;
         }
       }
       return false;
     });
 
-    if (direction === "CE") {
-      assetPrice += 400;
-    } else if (direction === "PE") {
-      assetPrice -= 400;
-    }
+    if (direction === "CE") assetPrice += intervalMinutes === 3 ? 600 : 400;
+    else if (direction === "PE") assetPrice -= intervalMinutes === 3 ? 600 : 400;
 
     let symbol;
     if (direction) {
-      symbol = await getSpecificCachedOption(
-        dailyAsset.name,
-        assetPrice,
-        direction,
-      );
+      try {
+        symbol = await getSpecificCachedOption(dailyAsset.name, assetPrice, direction);
+      } catch (e) {
+        logError("getSpecificCachedOption failed", e, {
+          base: dailyAsset?.name,
+          assetPrice,
+          direction,
+          intervalMinutes,
+        });
+      }
     }
 
-    console.log({ istNow, price, direction, signal, tf: "5m" });
+    logInfo("Signal snapshot", {
+      t: istNow.toISOString(),
+      price,
+      direction,
+      signal,
+      reason,
+      tf: intervalString,
+    });
 
-    for (const key of keys) {
-      if (key.timeFrame !== 5) continue;
-
+    // Trade loop
+    for (const key of keys || []) {
       try {
+        // Strict minute/second guards
+        if (intervalMinutes === 3) {
+          if (second >= 10) continue;
+          if (istMinute % 3 !== 0) continue;
+        } else if (intervalMinutes === 5) {
+          if (second !== 0) continue;
+          if (istMinute % 5 !== 0) continue;
+        }
+
         const getLTP = async (instrument) => {
           try {
             const res = await axios.get("https://api.kite.trade/quote/ltp", {
               headers: {
                 "X-Kite-Version": "3",
-                Authorization: `token ${apiKey}:${accessToken}`,
+                Authorization: `token ${adminKeys.apiKey}:${adminKeys.token}`,
               },
               params: { i: instrument },
             });
-            const ltp = res.data.data[instrument].last_price;
-            return ltp;
+            return res?.data?.data?.[instrument]?.last_price;
           } catch (err) {
-            console.error(
-              "❌ Error fetching LTP:",
-              err.response?.data || err.message,
-            );
+            logError("LTP fetch failed", err, { instrument });
             throw err;
           }
         };
@@ -905,40 +354,25 @@ WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`,
                 Authorization: `token ${key.apiKey}:${key.token}`,
               },
             });
-            const openingBalance =
-              res.data.data.equity.available.opening_balance;
-            return openingBalance;
+            return res?.data?.data?.equity?.available?.opening_balance;
           } catch (err) {
-            console.error(
-              "❌ Error fetching initial day balance:",
-              err.response?.data || err.message,
-            );
+            logError("Initial day balance fetch failed", err, { brokerKeyId: key.id });
             throw err;
           }
         };
 
         const getTodaysPnL = async () => {
           try {
-            const res = await axios.get(
-              "https://api.kite.trade/portfolio/positions",
-              {
-                headers: {
-                  "X-Kite-Version": "3",
-                  Authorization: `token ${key.apiKey}:${key.token}`,
-                },
+            const res = await axios.get("https://api.kite.trade/portfolio/positions", {
+              headers: {
+                "X-Kite-Version": "3",
+                Authorization: `token ${key.apiKey}:${key.token}`,
               },
-            );
-            const dayPositions = res.data.data.day || [];
-            const totalPnL = dayPositions.reduce(
-              (sum, pos) => sum + pos.pnl,
-              0,
-            );
-            return totalPnL;
+            });
+            const dayPositions = res?.data?.data?.day || [];
+            return dayPositions.reduce((sum, pos) => sum + (pos?.pnl || 0), 0);
           } catch (err) {
-            console.error(
-              "❌ Error fetching today's P&L:",
-              err.response?.data || err.message,
-            );
+            logError("Today's PnL fetch failed", err, { brokerKeyId: key.id });
             throw err;
           }
         };
@@ -949,7 +383,8 @@ WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`,
         let ltp;
         let noOfLots;
         if (direction && symbol) {
-          ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
+          const instrument = `${symbol.exchange}:${symbol.tradingsymbol}`;
+          ltp = await getLTP(instrument);
           noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
         }
 
@@ -978,126 +413,126 @@ WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`,
               Authorization: `token ${key.apiKey}:${key.token}`,
               "Content-Type": "application/x-www-form-urlencoded",
             };
-            const response = await axios.post(
-              "https://api.kite.trade/orders/regular",
-              data,
-              { headers },
-            );
-            console.log("✅ Order placed:", response.data);
+            const response = await axios.post("https://api.kite.trade/orders/regular", data, { headers });
+            logInfo("Order placed", {
+              tf: intervalString,
+              brokerKeyId: key.id,
+              tradingsymbol,
+              side: transaction_type,
+              qty: quantity,
+              order_id: response?.data?.data?.order_id,
+            });
             return response.data;
           } catch (err) {
-            console.error("❌ Order error:", err.response?.data || err.message);
+            logError("Order placement failed", err, {
+              tf: intervalString,
+              brokerKeyId: key.id,
+              tradingsymbol,
+              side: transaction_type,
+              qty: quantity,
+            });
             throw err;
           }
         };
 
-        async function newOrder(data) {
+        const newOrder = async (data) => {
           data.transaction_type = "BUY";
           return await placeIntradayOrder(data);
-        }
-
-        async function exitOrder(data) {
+        };
+        const exitOrder = async (data) => {
           data.transaction_type = "SELL";
           return await placeIntradayOrder(data);
-        }
+        };
 
-        const lastTrade = await TradeLog.findDoc(
-          { brokerKeyId: key.id, type: "entry" },
-          { allowNull: true },
-        );
+        const lastTrade = await TradeLog.findDoc({ brokerKeyId: key.id, type: "entry" }, { allowNull: true });
 
+        // Daily limits
         if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
           if (!lastTrade) {
             key.status = false;
-            console.log("Marking key as inactive, daily limit reached", key.id);
             await key.save();
+            logInfo("Deactivated key due to daily limit (no open trade)", {
+              tf: intervalString,
+              brokerKeyId: key.id,
+              pnl,
+              balance,
+            });
             continue;
           }
-
           const exitOrderData = {
             exchange: lastTrade.asset.split(":"),
-            tradingsymbol: lastTrade.asset.split(":")[11],
+            tradingsymbol: lastTrade.asset.split(":")[11] || lastTrade.asset.split(":")[12],
             quantity: lastTrade.quantity,
           };
-
-          console.log("Exiting last trade, daily limit reached", key.id);
+          logInfo("Exiting last trade, daily limit reached", { tf: intervalString, brokerKeyId: key.id, pnl, balance });
           await exitOrder(exitOrderData);
-
           lastTrade.type = "exit";
-          console.log("Updating last trade, marking as exited", key.id);
           await lastTrade.save();
-
           key.status = false;
-          console.log(
-            "Marking key as inactive, after exiting last trade",
-            key.id,
-          );
           await key.save();
+          logInfo("Deactivated key after exit (daily limit)", { tf: intervalString, brokerKeyId: key.id });
           continue;
         }
 
-        if (second >= 10) continue;
-        if (istMinute % 5 !== 0) continue;
         if (signal === "No Action") continue;
 
+        // Exit logic
         if (signal === "Exit" || signal === "PE Exit" || signal === "CE Exit") {
           if (!lastTrade) continue;
-
           const exitOrderData = {
             exchange: lastTrade.asset.split(":"),
-            tradingsymbol: lastTrade.asset.split(":")[11],
+            tradingsymbol: lastTrade.asset.split(":")[11] || lastTrade.asset.split(":")[12],
             quantity: lastTrade.quantity,
           };
-
           if (signal === "PE Exit" && lastTrade.direction === "PE") {
-            console.log("Signal PE EXIT, lastrade PE, exiting trade", key.id);
+            logInfo("PE Exit matched, exiting", { tf: intervalString, brokerKeyId: key.id });
             await exitOrder(exitOrderData);
             lastTrade.type = "exit";
-            console.log("Updating last trade", key.id);
             await lastTrade.save();
             continue;
           } else if (signal === "CE Exit" && lastTrade.direction === "CE") {
-            console.log("Signal CE EXIT, lasttrade CE, exiting trade", key.id);
+            logInfo("CE Exit matched, exiting", { tf: intervalString, brokerKeyId: key.id });
             await exitOrder(exitOrderData);
             lastTrade.type = "exit";
-            console.log("Updating last trade", key.id);
             await lastTrade.save();
             continue;
           }
-
           if (signal === "Exit") {
-            console.log("Signal Exit, Exiting last trade", key.id);
+            logInfo("Generic Exit, closing last trade", { tf: intervalString, brokerKeyId: key.id });
             await exitOrder(exitOrderData);
             lastTrade.type = "exit";
-            console.log("Updating last trade", key.id);
             await lastTrade.save();
             continue;
           }
         }
 
+        // Entry or reversal
         if (!symbol) continue;
+        if (!noOfLots || noOfLots <= 0) continue;
 
-        const newOrderData = {};
-        const exitOrderData = {};
-
-        newOrderData.exchange = symbol.exchange;
-        newOrderData.tradingsymbol = symbol.tradingsymbol;
-        newOrderData.quantity = noOfLots * symbol.lot_size;
-
-        if (lastTrade) {
-          exitOrderData.exchange = lastTrade.asset.split(":");
-          exitOrderData.tradingsymbol = lastTrade.asset.split(":")[11];
-          exitOrderData.quantity = lastTrade.quantity;
-        }
+        const newOrderData = {
+          exchange: symbol.exchange,
+          tradingsymbol: symbol.tradingsymbol,
+          quantity: noOfLots * symbol.lot_size,
+        };
 
         if (lastTrade) {
           if (lastTrade.direction === direction) continue;
 
-          console.log("Changing trade, exiting last trade", key.id);
-          await exitOrder(exitOrderData);
+          const exitOrderData = {
+            exchange: lastTrade.asset.split(":"),
+            tradingsymbol: lastTrade.asset.split(":")[11] || lastTrade.asset.split(":")[12],
+            quantity: lastTrade.quantity,
+          };
 
+          logInfo("Direction changed, exiting last trade", {
+            tf: intervalString,
+            brokerKeyId: key.id,
+            from: lastTrade.direction,
+            to: direction,
+          });
+          await exitOrder(exitOrderData);
           lastTrade.type = "exit";
-          console.log("Updating last trade", key.id);
           await lastTrade.save();
 
           const newTradeLog = {
@@ -1111,10 +546,8 @@ WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`,
             type: "entry",
           };
 
-          console.log("Placing new trade after exiting last", key.id);
+          logInfo("Placing new trade after exit", { tf: intervalString, brokerKeyId: key.id, symbol: newTradeLog.asset });
           await newOrder(newOrderData);
-
-          console.log("Creating new trade log, after exiting last", key.id);
           await TradeLog.create(newTradeLog);
         } else {
           const newTradeLog = {
@@ -1127,28 +560,68 @@ WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'`,
             quantity: newOrderData.quantity,
             type: "entry",
           };
-
-          console.log("Placing fresh trade", key.id);
+          logInfo("Placing fresh trade", { tf: intervalString, brokerKeyId: key.id, symbol: newTradeLog.asset });
           await newOrder(newOrderData);
-
-          console.log("Creating new trade log", key.id);
           await TradeLog.create(newTradeLog);
         }
       } catch (e) {
-        if (axios.isAxiosError(e)) {
-          console.error("❌ Cron Error (5m):", e.message);
-          if (e.response) {
-            console.error("📉 Response Data:", e.response.data);
-            console.error("📊 Status Code:", e.response.status);
-          }
-        } else {
-          console.error("❌ Unknown Error (5m):", e.message);
-        }
+        logError("Per-key execution failed", e, { tf: intervalString, brokerKeyId: key?.id });
       }
     }
+  }
+}
+
+// 3-minute schedule (small cron)
+cron.schedule("* * * * * *", async () => {
+  if (isRunning3Min) return;
+  isRunning3Min = true;
+  try {
+    await runTradingLogic({ intervalMinutes: 3, intervalString: "3minute" });
   } catch (e) {
-    console.log(e);
+    logError("3m cron failure", e);
   } finally {
-    isRunning5 = false;
+    isRunning3Min = false;
   }
 });
+
+// 5-minute schedule (small cron)
+cron.schedule("* * * * * *", async () => {
+  if (isRunning5Min) return;
+  isRunning5Min = true;
+  try {
+    await runTradingLogic({ intervalMinutes: 5, intervalString: "5minute" });
+  } catch (e) {
+    logError("5m cron failure", e);
+  } finally {
+    isRunning5Min = false;
+  }
+});
+
+// stop endpoint
+server.post("/stop/:id?", async (req, res) => {
+  try {
+    const { id } = req.params;
+    let targetKeys;
+    targetKeys = id
+      ? await BrokerKey.findDocById(id)
+      : await BrokerKey.findAll({
+          include: [{ model: Broker, where: { name: "Zerodha" } }],
+          where: { status: true },
+        });
+
+    const arr = Array.isArray(targetKeys) ? targetKeys : [targetKeys].filter(Boolean);
+    if (arr.length) {
+      await exitOpenTrades(arr);
+      logInfo("Deactivated keys for the day via /stop", { count: arr.length, ids: arr.map((k) => k.id) });
+    }
+    res.status(200).json({ status: true, message: "Deactivated for the day" });
+  } catch (e) {
+    logError("Stop endpoint failed", e);
+    res.status(500).json({ status: false, message: "Internal Server error" });
+  }
+});
+
+server.listen(3002, () => {
+  logInfo("Zerodha runner listening", { port: 3002 });
+});
+
