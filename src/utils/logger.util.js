@@ -137,4 +137,3 @@ export function logError(message, error, meta) {
 }
 
 export default logger;
-

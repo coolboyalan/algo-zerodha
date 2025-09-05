@@ -1,30 +1,33 @@
-import cron from "node-cron";
-import { main, getSpecificCachedOption } from "#utils/assetChecker";
-import env from "#configs/env";
-import Trade from "#models/trade";
+// app.js
 import qs from "qs";
 import axios from "axios";
-import { getISTMidnightFakeUTCString } from "#utils/dayChecker";
+import cron from "node-cron";
+import express from "express";
+import Broker from "#models/broker";
+import TradeLog from "#models/tradeLog";
 import sequelize from "#configs/database";
 import BrokerKey from "#models/brokerKey";
-import Broker from "#models/broker";
-import express from "express";
-import TradeLog from "#models/tradeLog";
+import { resolveAngelOption } from "#utils/angelInstrument";
+import { getISTMidnightFakeUTCString } from "#utils/dayChecker";
+import { main, getSpecificCachedOption } from "#utils/assetChecker";
+import logger, { logInfo, logWarn, logError } from "#utils/logger";
 
+// ---------- Boot ----------
 main();
-
 try {
   await sequelize.authenticate();
-  console.log("connected");
+  logInfo("DB connected"); // production: no secrets
 } catch (e) {
-  console.log("Cannot connect");
-  process.exit();
+  logError("DB connection failed", e);
+  process.exit(1);
 }
 
+// ---------- Globals (hot cache) ----------
 let dailyAsset = null;
 let keys = null;
 let adminKeys = null;
 let dailyLevels = null;
+let isRunning = false;
 
 const dayMap = {
   1: "Monday",
@@ -34,28 +37,35 @@ const dayMap = {
   5: "Friday",
 };
 
-// Helper to format to Kite-compatible IST timestamp: "YYYY-MM-DD HH:mm:00"
-function toKiteISTFormat(dateObj) {
-  const local = new Date(
-    dateObj.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+// ---------- Time helpers (IST everywhere) ----------
+function nowIST() {
+  return new Date(
+    new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
   );
-
-  const yyyy = local.getFullYear();
-  const mm = String(local.getMonth() + 1).padStart(2, "0");
-  const dd = String(local.getDate()).padStart(2, "0");
-  const hh = String(local.getHours()).padStart(2, "0");
-  const min = String(local.getMinutes()).padStart(2, "0");
-
-  return `${yyyy}-${mm}-${dd} ${hh}:${min}:00`;
 }
-let isRunning = false;
+function formatIST(d) {
+  const nd = new Date(d.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${nd.getFullYear()}-${pad(nd.getMonth() + 1)}-${pad(nd.getDate())} ${pad(nd.getHours())}:${pad(
+    nd.getMinutes(),
+  )}:${pad(nd.getSeconds())}`;
+}
+function alignToMinuteIST(d) {
+  const nd = new Date(d.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+  nd.setSeconds(0, 0);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${nd.getFullYear()}-${pad(nd.getMonth() + 1)}-${pad(nd.getDate())} ${pad(nd.getHours())}:${pad(
+    nd.getMinutes(),
+  )}`;
+}
 
-async function exitOpenTrades(keys) {
-  for (const key of keys) {
+// ---------- Exit helper (Zerodha orders unchanged) ----------
+async function exitOpenTrades(brokerKeys) {
+  for (const key of brokerKeys) {
     const placeIntradayOrder = async ({
       exchange = "NSE",
       tradingsymbol,
-      transaction_type = "BUY", // or "SELL"
+      transaction_type = "BUY",
       quantity = 1,
     }) => {
       try {
@@ -65,264 +75,271 @@ async function exitOpenTrades(keys) {
           transaction_type,
           order_type: "MARKET",
           quantity,
-          product: "MIS", // Intraday
+          product: "MIS",
           validity: "DAY",
         });
-
         const headers = {
           "X-Kite-Version": "3",
           Authorization: `token ${key.apiKey}:${key.token}`,
           "Content-Type": "application/x-www-form-urlencoded",
         };
-
         const response = await axios.post(
           "https://api.kite.trade/orders/regular",
           data,
           { headers },
         );
-
-        console.log("✅ Order placed:", response.data);
+        logInfo("Order placed", {
+          brokerKeyId: key.id,
+          type: transaction_type,
+          tradingsymbol,
+          qty: quantity,
+        });
         return response.data;
       } catch (err) {
-        console.error("❌ Order error:", err.response?.data || err.message);
+        logError("Order placement failed", err, {
+          brokerKeyId: key.id,
+          tradingsymbol,
+          side: transaction_type,
+        });
         throw err;
       }
     };
-
-    async function newOrder(data) {
-      data.transaction_type = "BUY";
-      return await placeIntradayOrder(data);
-    }
-
-    async function exitOrder(data) {
-      data.transaction_type = "SELL";
-      return await placeIntradayOrder(data);
-    }
+    const newOrder = (data) =>
+      placeIntradayOrder({ ...data, transaction_type: "BUY" });
+    const exitOrder = (data) =>
+      placeIntradayOrder({ ...data, transaction_type: "SELL" });
 
     const lastTrade = await TradeLog.findDoc(
       { brokerKeyId: key.id, type: "entry" },
       { allowNull: true },
     );
-
     if (!lastTrade) {
       if (!key.status) continue;
-
       key.status = false;
-      console.log("Marking key as inactive, Closing time", key.id);
       await key.save();
+      logInfo("Broker key marked inactive at close (no open trade)", {
+        brokerKeyId: key.id,
+      });
       continue;
     }
+
     const exitOrderData = {
-      exchange: lastTrade.asset.split(":")[0],
-      tradingsymbol: lastTrade.asset.split(":")[1],
+      exchange: lastTrade.asset.split(":"),
+      tradingsymbol: lastTrade.asset.split(":")[20],
       quantity: lastTrade.quantity,
     };
-    console.log("Exiting last trade, Closing time", key.id);
+
+    logInfo("Exiting open trade at close", {
+      brokerKeyId: key.id,
+      asset: lastTrade.asset,
+      qty: lastTrade.quantity,
+    });
     await exitOrder(exitOrderData);
+
     lastTrade.type = "exit";
-    console.log("Updating last trade, Closing time", key.id);
     await lastTrade.save();
+
     key.status = false;
-    console.log(
-      "Marking key as inactive, after exiting last trade. Closing time",
-      key.id,
-    );
     await key.save();
-    continue;
+    logInfo("Closed trade and deactivated broker key at close", {
+      brokerKeyId: key.id,
+    });
   }
 }
 
+// ---------- Cron (1s) ----------
 cron.schedule("* * * * * *", async () => {
   if (isRunning) return;
   isRunning = true;
-  try {
-    const istNow = new Date(
-      new Date().toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
-    );
 
+  try {
+    let istNow = nowIST(); // Indian time basis
     const istHour = istNow.getHours();
     const istMinute = istNow.getMinutes();
     const second = istNow.getSeconds();
+
     const preRange =
       (istHour === 8 && istMinute >= 30) ||
       (istHour > 8 && istHour < 15) ||
       (istHour === 15 && istMinute <= 30);
-
     const isInMarketRange =
       (istHour === 9 && istMinute >= 30) ||
       (istHour > 9 && istHour < 15) ||
       (istHour === 15 && istMinute <= 15);
 
-    try {
-      if (!preRange && !isInMarketRange) return;
+    if (!preRange && !isInMarketRange) return;
 
-      if (preRange) {
-        if (!dailyLevels) {
-          const [dailyData] = await sequelize.query(`
-			  SELECT * FROM "DailyLevels" WHERE "forDay" = '${getISTMidnightFakeUTCString()}'
-			  `);
+    // Pre-market initialization
+    if (preRange) {
+      if (!dailyLevels) {
+        const forDay = getISTMidnightFakeUTCString();
+        const [dailyData] = await sequelize.query(
+          // `SELECT * FROM "DailyLevels" WHERE "forDay" = '${forDay}'`,
+          `SELECT * FROM "DailyLevels" WHERE "forDay" = '2025-09-04'`,
+        );
+        dailyLevels = dailyData[0];
+        logInfo("Daily levels loaded", { forDay, found: !!dailyLevels });
+      }
 
-          dailyLevels = dailyData[0];
-        }
-
-        if (!dailyAsset) {
-          const day = dayMap[istNow.getDay()];
-          const [response] = await sequelize.query(
-            `SELECT "name", "zerodhaToken", "Assets"."id" FROM "DailyAssets"
+      if (!dailyAsset) {
+        const day = dayMap[istNow.getDay()];
+        const [response] = await sequelize.query(
+          `SELECT "name", "zerodhaToken", "angeloneToken" AS "angelToken", "Assets"."id"
+           FROM "DailyAssets"
            INNER JOIN "Assets" ON "DailyAssets"."assetId" = "Assets"."id"
            WHERE "day" = '${day}'`,
-          );
-
-          if (!response.length) {
-            return console.log("❌ No asset available for today");
-          }
-
-          dailyAsset = response[0];
-        }
-
-        if (!keys || !adminKeys || (istMinute % 1 === 0 && second % 40 === 0)) {
-          const responseKeys = await BrokerKey.findAll({
-            include: [
-              {
-                model: Broker,
-                where: {
-                  name: "Zerodha",
-                },
-              },
-            ],
-            where: {
-              status: true,
-            },
-          });
-          const [admin] = await sequelize.query(
-            `SELECT * FROM "BrokerKeys"
-         INNER JOIN "Users" ON "BrokerKeys"."userId" = "Users"."id"
-         INNER JOIN "Brokers" ON "BrokerKeys"."brokerId" = "Brokers"."id"
-         WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Zerodha'
-         `,
-          );
-
-          adminKeys = admin[0];
-          keys = responseKeys;
-        }
-      }
-
-      if (istHour === 15 && istMinute === 15) {
-        return await exitOpenTrades(keys);
-      }
-
-      if (isInMarketRange && second % 10 === 0) {
-        const toTime = toKiteISTFormat(istNow);
-        const fromTime = toKiteISTFormat(
-          new Date(istNow.getTime() - 3 * 60 * 1000),
         );
-
-        const instrumentToken = dailyAsset.zerodhaToken;
-        const interval = "3minute";
-        const apiKey = adminKeys.apiKey;
-        const accessToken = adminKeys.token;
-
-        const url = `https://api.kite.trade/instruments/historical/${instrumentToken}/${interval}?from=${encodeURIComponent(
-          fromTime,
-        )}&to=${encodeURIComponent(toTime)}&continuous=false`;
-
-        const response = await axios.get(url, {
-          headers: {
-            "X-Kite-Version": "3",
-            Authorization: `token ${apiKey}:${accessToken}`,
-          },
+        if (!response.length) {
+          logWarn("No daily asset configured for trading day", { day });
+          return;
+        }
+        dailyAsset = response[0];
+        logInfo("Daily asset selected", {
+          name: dailyAsset.name,
+          exchange: dailyAsset.exchange,
         });
+      }
 
-        const { data } = response.data;
+      if (!keys || !adminKeys || (istMinute % 1 === 0 && second % 40 === 0)) {
+        const responseKeys = await BrokerKey.findAll({
+          include: [{ model: Broker, where: { name: "Zerodha" } }],
+          where: { status: true },
+        });
+        const [admin] = await sequelize.query(
+          `SELECT * FROM "BrokerKeys"
+           INNER JOIN "Users" ON "BrokerKeys"."userId" = "Users"."id"
+           INNER JOIN "Brokers" ON "BrokerKeys"."brokerId" = "Brokers"."id"
+           WHERE "Users"."role" = 'admin' AND "Brokers"."name" = 'Angel One'`,
+        );
+        adminKeys = admin[0];
+        keys = responseKeys || [];
+        logInfo("Keys refreshed", {
+          activeZerodhaKeys: keys.length,
+          haveAngelAdmin: !!adminKeys,
+        });
+      }
+    }
+
+    // Auto-exit at 15:15 IST
+    if (istHour === 15 && istMinute === 15) {
+      await exitOpenTrades(keys || []);
+      return;
+    }
+
+    // Live loop every 10s
+    if (isInMarketRange && second % 10 === 0) {
+      // Build an aligned 3-minute window in IST
+      const endIST = new Date(istNow.getTime());
+      const startIST = new Date(istNow.getTime() - 3 * 60 * 1000);
+      let todate = alignToMinuteIST(endIST);
+      let fromdate = alignToMinuteIST(startIST);
+
+      // Enforce 3-minute grid if off
+      const mEnd = Number(todate.slice(14, 16));
+      const mStart = Number(fromdate.slice(14, 16));
+      if (mEnd - mStart !== 3 || mEnd % 3 !== mStart % 3) {
+        const base = new Date(
+          endIST.toLocaleString("en-US", { timeZone: "Asia/Kolkata" }),
+        );
+        const alignedM = base.getMinutes() - (base.getMinutes() % 3);
+        base.setMinutes(alignedM, 0, 0);
+        const startFixed = new Date(base.getTime() - 3 * 60 * 1000);
+        todate = alignToMinuteIST(base);
+        fromdate = alignToMinuteIST(startFixed);
+      }
+
+      const exchange = dailyAsset.exchange || "NSE";
+      const symboltoken = String(dailyAsset.angelToken || "");
+      const url =
+        "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData";
+      const headers = {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${adminKeys?.token || adminKeys?.jwt || ""}`,
+        "X-UserType": "USER",
+        "X-SourceID": "WEB",
+        "X-ClientLocalIP": "127.0.0.1",
+        "X-ClientPublicIP": "127.0.0.1",
+        "X-MACAddress": "00:00:00:00:00:00",
+      };
+      if (adminKeys?.apiKey) headers["X-PrivateKey"] = adminKeys.apiKey;
+
+      const body = {
+        exchange,
+        symboltoken,
+        interval: "THREE_MINUTE",
+        fromdate,
+        todate,
+      };
+
+      try {
+        const response = await axios.post(url, body, { headers });
+        const payload = response.data;
 
         if (
-          !data ||
-          !Array.isArray(data.candles) ||
-          data.candles.length === 0
+          !payload ||
+          !Array.isArray(payload.data) ||
+          payload.data.length === 0
         ) {
-          console.log("⚠️ No candle data available");
+          logWarn("Angel candle fetch returned empty data", {
+            exchange,
+            symboltoken,
+            fromdate,
+            todate,
+          });
           return;
         }
 
-        const latestCandle = data.candles[data.candles.length - 1];
-        const price = latestCandle[4]; // close price
-
-        if (price === null || price === undefined) {
-          return console.log("⚠️ Invalid Price");
+        // Candle: [datetime, open, high, low, close, volume]
+        const latestCandle = payload.data[payload.data.length - 1];
+        const price = latestCandle[4];
+        if (price == null) {
+          logWarn("Angel candle missing close price", {
+            latestCandle,
+            exchange,
+            symboltoken,
+          });
+          return;
         }
 
-        const { bc, tc, r1, r2, r3, r4, s1, s2, s3, s4 } = dailyLevels;
+        const { bc, tc, r1, r2, r3, r4, s1, s2, s3, s4, buffer } =
+          dailyLevels || {};
+        const BUFFER = buffer ?? 0;
 
-        const BUFFER = dailyLevels.buffer;
         let signal = "No Action";
-        let reason = "Price is in a neutral zone.";
         let direction;
-        let assetPrice;
-        let lastTrade;
+        let assetPrice =
+          price % 100 > 50
+            ? Math.floor(price / 100) * 100 + 100
+            : Math.floor(price / 100) * 100;
 
-        if (price % 100 > 50) {
-          assetPrice = parseInt(price / 100) * 100 + 100;
-        } else {
-          assetPrice = parseInt(price / 100) * 100;
-        }
-
-        // If price is above TC and within TC + BUFFER, Buy
-        if (price >= tc && price <= tc + BUFFER) {
-          direction = "CE";
-          signal = "Buy";
-          reason = "Price is above TC within buffer.";
-        }
-        // If price is below BC and within BC - BUFFER, Sell
-        else if (price <= bc && price >= bc - BUFFER) {
-          direction = "PE";
-          signal = "Sell";
-          reason = "Price is below BC within buffer.";
-        }
-        // If price is between TC and BC, No Action
-        else if (price < tc && price > bc) {
-          signal = "Exit";
-          reason = "Price is within CPR range.";
+        if (tc != null && bc != null) {
+          if (price >= tc && price <= tc + BUFFER) {
+            direction = "CE";
+            signal = "Buy";
+          } else if (price <= bc && price >= bc - BUFFER) {
+            direction = "PE";
+            signal = "Sell";
+          } else if (price < tc && price > bc) {
+            signal = "Exit";
+          }
         }
 
         const levelsMap = { r1, r2, r3, r4, s1, s2, s3, s4 };
-
-        Object.entries(levelsMap).forEach(([levelName, level]) => {
+        for (const [_, level] of Object.entries(levelsMap)) {
+          if (level == null) continue;
           if (price > level && price <= level + BUFFER) {
             signal = "Buy";
-            reason = `Price is above ${levelName} (${level}) within buffer.`;
             direction = "CE";
           } else if (price < level && price >= level - BUFFER) {
             signal = "Sell";
-            reason = `Price is below ${levelName} (${level}) within buffer.`;
             direction = "PE";
           }
-        });
-
-        const innerLevelMap = { r1, r2, r3, r4, s1, s2, s3, s4, tc, bc };
-
-        Object.entries(innerLevelMap).find(([levelName, level]) => {
-          if (signal === "No Action") {
-            if (data.close > level && data.open < level) {
-              signal = "PE Exit";
-              reason = `Price crossed the level ${levelName}`;
-              return true;
-            }
-            if (data.close < level && data.open > level) {
-              signal = "CE Exit";
-              reason = `Price crossed the level ${levelName}`;
-              return true;
-            }
-          }
-        });
-
-        let symbol;
-
-        if (direction === "CE") {
-          assetPrice += 600;
-        } else if (direction === "PE") {
-          assetPrice -= 600;
         }
 
+        if (direction === "CE") assetPrice += 800;
+        else if (direction === "PE") assetPrice -= 800;
+
+        let symbol;
         if (direction) {
           symbol = await getSpecificCachedOption(
             dailyAsset.name,
@@ -331,32 +348,75 @@ cron.schedule("* * * * * *", async () => {
           );
         }
 
-        console.log({ istNow, price, direction, signal });
+        logInfo("Signal computed", {
+          at: formatIST(istNow),
+          price,
+          direction: direction || null,
+          signal,
+        });
 
-        for (const key of keys) {
+        // Per-broker-key execution
+        for (const key of keys || []) {
           try {
-            const getLTP = async (instrument) => {
-              try {
-                const res = await axios.get(
-                  "https://api.kite.trade/quote/ltp",
-                  {
-                    headers: {
-                      "X-Kite-Version": "3",
-                      Authorization: `token ${apiKey}:${accessToken}`,
-                    },
-                    params: {
-                      i: instrument, // e.g., 'NSE:RELIANCE'
-                    },
-                  },
-                );
+            const apiKey = adminKeys?.apiKey;
+            const accessToken = adminKeys?.token;
 
-                const ltp = res.data.data[instrument].last_price;
+            const getLTP = async (name, price, direction) => {
+              try {
+                const url =
+                  "https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote";
+                const headers = {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${adminKeys?.token || adminKeys?.jwt || ""}`,
+                  "X-UserType": "USER",
+                  "X-SourceID": "WEB",
+                  "X-ClientLocalIP": "127.0.0.1",
+                  "X-ClientPublicIP": "127.0.0.1",
+                  "X-MACAddress": "00:00:00:00:00:00",
+                };
+                if (adminKeys?.apiKey)
+                  headers["X-PrivateKey"] = adminKeys.apiKey;
+
+                const symbol = await resolveAngelOption(name, price, direction);
+
+                const body = {
+                  mode: "LTP",
+                  exchangeTokens: { [symbol.exch_seg]: [String(symbol.token)] },
+                };
+
+                const res = await axios.post(url, body, { headers });
+                const fetched = res?.data?.data?.fetched || [];
+                if (!Array.isArray(fetched) || fetched.length === 0) {
+                  const unfetched = res?.data?.data?.unfetched || [];
+                  logWarn("Angel LTP fetch returned no fetched data", {
+                    brokerKeyId: key.id,
+                    instrument,
+                    exchange,
+                    symboltoken,
+                    message: res?.data?.message,
+                    errorcode: res?.data?.errorcode,
+                    unfetched,
+                  });
+                  throw new Error("Angel LTP unavailable");
+                }
+                const ltp = fetched[0]?.ltp;
+                if (typeof ltp !== "number") {
+                  logWarn("Angel LTP missing or invalid", {
+                    brokerKeyId: key.id,
+                    instrument,
+                    exchange,
+                    symboltoken,
+                    fetched: fetched[0],
+                  });
+                  throw new Error("Invalid LTP");
+                }
                 return ltp;
               } catch (err) {
-                console.error(
-                  "❌ Error fetching LTP:",
-                  err.response?.data || err.message,
-                );
+                logError("Angel LTP fetch failed", err, {
+                  brokerKeyId: key.id,
+                  instrument,
+                });
+                console.log(err);
                 throw err;
               }
             };
@@ -372,15 +432,11 @@ cron.schedule("* * * * * *", async () => {
                     },
                   },
                 );
-
-                const openingBalance =
-                  res.data.data.equity.available.opening_balance;
-                return openingBalance;
+                return res.data.data.equity.available.opening_balance;
               } catch (err) {
-                console.error(
-                  "❌ Error fetching initial day balance:",
-                  err.response?.data || err.message,
-                );
+                logError("Kite margins fetch failed", err, {
+                  brokerKeyId: key.id,
+                });
                 throw err;
               }
             };
@@ -396,40 +452,35 @@ cron.schedule("* * * * * *", async () => {
                     },
                   },
                 );
-
                 const dayPositions = res.data.data.day || [];
-                const totalPnL = dayPositions.reduce(
-                  (sum, pos) => sum + pos.pnl,
-                  0,
-                );
-                return totalPnL;
+                return dayPositions.reduce((sum, pos) => sum + pos.pnl, 0);
               } catch (err) {
-                console.error(
-                  "❌ Error fetching today's P&L:",
-                  err.response?.data || err.message,
-                );
+                logError("Kite positions fetch failed", err, {
+                  brokerKeyId: key.id,
+                });
                 throw err;
               }
             };
 
             const balance = await getInitialDayBalance();
             const usableFunds = (balance / 100) * 10;
-            let ltp;
-            let noOfLots;
 
-            if (direction) {
-              ltp = await getLTP(`${symbol.exchange}:${symbol.tradingsymbol}`);
+            let ltp;
+            let noOfLots = 0;
+            if (direction && symbol) {
+              ltp = await getLTP(dailyAsset.name, assetPrice, direction);
               noOfLots = Math.floor(usableFunds / (ltp * symbol.lot_size));
             }
-            const pnl = await getTodaysPnL();
 
+            const pnl = await getTodaysPnL();
             const maxLoss = (balance / 100) * 4;
             const maxProfit = (balance / 100) * 8;
 
+            // Place/cancel logic
             const placeIntradayOrder = async ({
               exchange = "NSE",
               tradingsymbol,
-              transaction_type = "BUY", // or "SELL"
+              transaction_type = "BUY",
               quantity = 1,
             }) => {
               try {
@@ -439,152 +490,112 @@ cron.schedule("* * * * * *", async () => {
                   transaction_type,
                   order_type: "MARKET",
                   quantity,
-                  product: "MIS", // Intraday
+                  product: "MIS",
                   validity: "DAY",
                 });
-
                 const headers = {
                   "X-Kite-Version": "3",
                   Authorization: `token ${key.apiKey}:${key.token}`,
                   "Content-Type": "application/x-www-form-urlencoded",
                 };
-
                 const response = await axios.post(
                   "https://api.kite.trade/orders/regular",
                   data,
                   { headers },
                 );
-
-                console.log("✅ Order placed:", response.data);
+                logInfo("Kite order placed", {
+                  brokerKeyId: key.id,
+                  tradingsymbol,
+                  side: transaction_type,
+                  quantity,
+                });
                 return response.data;
               } catch (err) {
-                console.error(
-                  "❌ Order error:",
-                  err.response?.data || err.message,
-                );
+                logError("Kite order failed", err, {
+                  brokerKeyId: key.id,
+                  tradingsymbol,
+                  side: transaction_type,
+                });
                 throw err;
               }
             };
-
-            async function newOrder(data) {
-              data.transaction_type = "BUY";
-              return await placeIntradayOrder(data);
-            }
-
-            async function exitOrder(data) {
-              data.transaction_type = "SELL";
-              return await placeIntradayOrder(data);
-            }
+            const newOrder = (data) =>
+              placeIntradayOrder({ ...data, transaction_type: "BUY" });
+            const exitOrder = (data) =>
+              placeIntradayOrder({ ...data, transaction_type: "SELL" });
 
             const lastTrade = await TradeLog.findDoc(
               { brokerKeyId: key.id, type: "entry" },
               { allowNull: true },
             );
 
+            // Daily limit checks
             if (pnl + maxLoss <= 0 || pnl >= maxProfit) {
               if (!lastTrade) {
                 key.status = false;
-                console.log(
-                  "Marking key as inactive, daily limit reached",
-                  key.id,
-                );
                 await key.save();
+                logWarn(
+                  "Daily limit reached, broker key deactivated (no open trade)",
+                  {
+                    brokerKeyId: key.id,
+                    pnl,
+                    balance,
+                  },
+                );
                 continue;
               }
               const exitOrderData = {
-                exchange: lastTrade.asset.split(":")[0],
-                tradingsymbol: lastTrade.asset.split(":")[1],
+                exchange: lastTrade.asset.split(":"),
+                tradingsymbol: lastTrade.asset.split(":")[20],
                 quantity: lastTrade.quantity,
               };
-              console.log("Exiting last trade, daily limit reached", key.id);
+              logWarn("Daily limit reached, exiting open trade", {
+                brokerKeyId: key.id,
+                pnl,
+                balance,
+              });
               await exitOrder(exitOrderData);
               lastTrade.type = "exit";
-              console.log("Updating last trade, marking as exited", key.id);
               await lastTrade.save();
               key.status = false;
-              console.log(
-                "Marking key as inactive, after exiting last trade",
-                key.id,
-              );
               await key.save();
+              logWarn(
+                "Daily limit reached, broker key deactivated after exit",
+                { brokerKeyId: key.id },
+              );
               continue;
             }
+
+            // Entry/Exit throttles
             if (second >= 10) continue;
             if (istMinute % 3 !== 0) continue;
-            if (signal === "No Action") continue;
+            if (signal === "No Action" || !direction || !symbol) continue;
 
-            if (
-              signal === "Exit" ||
-              signal === "PE Exit" ||
-              signal === "CE Exit"
-            ) {
-              if (!lastTrade) continue;
+            console.log(istNow.toString());
+
+            if (lastTrade) {
+              // Only flip if direction changed
+              if (lastTrade.direction === direction) continue;
 
               const exitOrderData = {
-                exchange: lastTrade.asset.split(":")[0],
-                tradingsymbol: lastTrade.asset.split(":")[1],
+                exchange: lastTrade.asset.split(":"),
+                tradingsymbol: lastTrade.asset.split(":")[20],
                 quantity: lastTrade.quantity,
               };
-
-              if (signal === "PE Exit") {
-                if (lastTrade.direction === "PE") {
-                  console.log(
-                    "Signal PE EXIT, lastrade PE, exiting trade",
-                    key.id,
-                  );
-                  await exitOrder(exitOrderData);
-                  lastTrade.type = "exit";
-                  console.log("Updating last trade", key.id);
-                  await lastTrade.save();
-                  continue;
-                }
-                continue;
-              } else if (signal === "CE Exit") {
-                if (lastTrade.direction === "CE") {
-                  console.log(
-                    "Signal CE EXIT, lasttrade CE, exiting trade",
-                    key.id,
-                  );
-                  await exitOrder(exitOrderData);
-                  lastTrade.type = "exit";
-                  console.log("Updating last trade", key.id);
-                  await lastTrade.save();
-                  continue;
-                }
-                continue;
-              }
-
-              if (signal === "Exit") {
-                console.log("Signal Exit, Exiting last trade", key.id);
-                await exitOrder(exitOrderData);
-                lastTrade.type = "exit";
-                console.log("Updating last trade", key.id);
-                await lastTrade.save();
-                continue;
-              }
-            }
-
-            const newOrderData = {};
-            const exitOrderData = {};
-
-            newOrderData.exchange = symbol.exchange;
-            newOrderData.tradingsymbol = symbol.tradingsymbol;
-            newOrderData.quantity = noOfLots * symbol.lot_size;
-
-            if (lastTrade) {
-              exitOrderData.exchange = lastTrade.asset.split(":")[0];
-              exitOrderData.tradingsymbol = lastTrade.asset.split(":")[1];
-              exitOrderData.quantity = lastTrade.quantity;
-            }
-
-            if (lastTrade) {
-              if (lastTrade.direction === direction) continue;
-              console.log("Changing trade, exiting last trade", key.id);
+              logInfo("Switching direction: exiting previous trade", {
+                brokerKeyId: key.id,
+              });
               await exitOrder(exitOrderData);
               lastTrade.type = "exit";
-              console.log("Updating last trade", key.id);
               await lastTrade.save();
-              const newTradeLog = {
+
+              const newOrderData = {
+                exchange: symbol.exchange,
+                tradingsymbol: symbol.tradingsymbol,
+                quantity: Math.max(1, Math.floor(noOfLots * symbol.lot_size)),
+              };
+              await newOrder(newOrderData);
+              await TradeLog.create({
                 brokerId: key.brokerId,
                 brokerKeyId: key.id,
                 userId: key.userId,
@@ -593,14 +604,24 @@ cron.schedule("* * * * * *", async () => {
                 direction,
                 quantity: newOrderData.quantity,
                 type: "entry",
-              };
-
-              console.log("Placing new trade after exiting last", key.id);
-              await newOrder(newOrderData);
-              console.log("Creating new trade log, after exiting last", key.id);
-              await TradeLog.create(newTradeLog);
+              });
+              logInfo("New trade placed after switching", {
+                brokerKeyId: key.id,
+                symbol: symbol.tradingsymbol,
+              });
             } else {
-              const newTradeLog = {
+              // Fresh entry
+              const newOrderData = {
+                exchange: symbol.exchange,
+                tradingsymbol: symbol.tradingsymbol,
+                quantity: Math.max(1, Math.floor(noOfLots * symbol.lot_size)),
+              };
+              logInfo("Placing fresh trade", {
+                brokerKeyId: key.id,
+                tradingsymbol: symbol.tradingsymbol,
+              });
+              await newOrder(newOrderData);
+              await TradeLog.create({
                 brokerId: key.brokerId,
                 brokerKeyId: key.id,
                 userId: key.userId,
@@ -609,70 +630,68 @@ cron.schedule("* * * * * *", async () => {
                 direction,
                 quantity: newOrderData.quantity,
                 type: "entry",
-              };
-
-              console.log("Placing fresh trade", key.id);
-              await newOrder(newOrderData);
-              console.log("Creating new trade log", key.id);
-              await TradeLog.create(newTradeLog);
+              });
+              logInfo("Trade log created", {
+                brokerKeyId: key.id,
+                tradingsymbol: symbol.tradingsymbol,
+              });
             }
           } catch (e) {
-            console.log(e);
+            logError("Per-broker-key processing failed", e, {
+              brokerKeyId: key?.id || null,
+            });
+            console.log(e.response.data);
           }
         }
-
-        // Example usage
-      }
-    } catch (e) {
-      if (axios.isAxiosError(e)) {
-        console.error("❌ Cron Error:", e.message);
-        if (e.response) {
-          console.error("📉 Response Data:", e.response.data);
-          console.error("📊 Status Code:", e.response.status);
-        }
-      } else {
-        console.error("❌ Unknown Error:", e.message);
+      } catch (err) {
+        // Include Angel error payload if available
+        const status = err?.response?.status;
+        const data = err?.response?.data;
+        logError("Angel historical fetch failed", err, {
+          status,
+          errorPayload: data,
+          exchange,
+          symboltoken,
+          fromdate,
+          todate,
+        });
       }
     }
   } catch (e) {
+    logError("Cron loop failed", e);
     console.log(e);
   } finally {
     isRunning = false;
   }
 });
 
+// ---------- HTTP ----------
 const server = express();
 
-server.post("/stop/:id?", async (req, res, next) => {
+server.post("/stop/:id?", async (req, res) => {
   try {
     const { id } = req.params;
-    let keys;
-    keys = id
+    let brokerKeys = id
       ? await BrokerKey.findDocById(id)
       : await BrokerKey.findAll({
-          include: [
-            {
-              model: Broker,
-              where: {
-                name: "Zerodha",
-              },
-            },
-          ],
-          where: {
-            status: true,
-          },
+          include: [{ model: Broker, where: { name: "Zerodha" } }],
+          where: { status: true },
         });
 
-    keys = Array.isArray(keys) ? keys : [keys];
-
-    if (keys.length) {
-      await exitOpenTrades(Array.isArray(keys) ? keys : [keys]);
+    brokerKeys = Array.isArray(brokerKeys) ? brokerKeys : [brokerKeys];
+    if (brokerKeys.length) {
+      await exitOpenTrades(brokerKeys);
     }
+
+    logInfo("Deactivated broker keys via /stop", {
+      count: brokerKeys.length,
+      ids: brokerKeys.map((k) => k.id),
+    });
     res.status(200).json({ status: true, message: "Deactivated for the day" });
   } catch (e) {
-    console.log(e);
-    res.status(400).json({ status: true, message: "Failed" });
+    logError("/stop handler failed", e);
+    res.status(400).json({ status: false, message: "Failed" });
   }
 });
 
-server.listen(3002);
+server.listen(3002, () => logInfo("Server listening", { port: 3002 }));
